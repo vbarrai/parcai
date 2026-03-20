@@ -1,0 +1,309 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROFILE_TPL="$SCRIPT_DIR/profiles/macos.sb.tpl"
+
+# --- Defaults ---
+NO_NETWORK=false
+DRY_RUN=false
+VERBOSE=false
+AUTO_APPLY=false
+AUTO_DISCARD=false
+EXTRA_ALLOW=()
+EXTRA_RW=()
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# --- Functions ---
+
+usage() {
+  cat <<EOF
+${BOLD}parcai${RESET} v${VERSION} — Lightweight shell isolation for AI agents
+
+${BOLD}Usage:${RESET}
+  parcai [options]
+
+${BOLD}Options:${RESET}
+  --allow <path>     Additional path to whitelist (read-only). Repeatable.
+  --rw <path>        Additional path to whitelist (read-write). Repeatable.
+  --no-network       Deny all network access inside the sandbox.
+  --apply            Auto-apply changes on exit (skip confirmation).
+  --discard          Auto-discard changes on exit (skip confirmation).
+  --dry-run          Print the sandbox config without executing.
+  --verbose          Show sandbox setup details.
+  --help             Show help.
+  --version          Show version.
+EOF
+}
+
+die() {
+  echo -e "${RED}error:${RESET} $1" >&2
+  exit 1
+}
+
+info() {
+  echo -e "${CYAN}parcai:${RESET} $1"
+}
+
+warn() {
+  echo -e "${YELLOW}parcai:${RESET} $1"
+}
+
+check_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "parcai currently only supports macOS"
+  command -v sandbox-exec >/dev/null 2>&1 || die "sandbox-exec not found"
+}
+
+check_apfs() {
+  local cwd="$1"
+  local fstype
+  fstype=$(diskutil info "$(df "$cwd" | tail -1 | awk '{print $1}')" 2>/dev/null | grep "Type (Bundle)" | awk '{print $NF}')
+  if [[ "$fstype" != "apfs" ]]; then
+    warn "filesystem is not APFS — clone will be a full copy (slower)"
+    return 1
+  fi
+  return 0
+}
+
+create_clone() {
+  local src="$1"
+  local dst="$2"
+
+  if check_apfs "$src" 2>/dev/null; then
+    # APFS clone: instant, zero disk cost
+    cp -c -R "$src" "$dst" 2>/dev/null && return 0
+  fi
+
+  # Fallback: regular copy
+  cp -R "$src" "$dst"
+}
+
+generate_profile() {
+  local clone="$1"
+  local home="$2"
+  local profile
+
+  profile=$(cat "$PROFILE_TPL")
+
+  # Substitute placeholders
+  profile="${profile//\{\{CLONE\}\}/$clone}"
+  profile="${profile//\{\{HOME\}\}/$home}"
+
+  # Network policy
+  if $NO_NETWORK; then
+    profile="${profile//\{\{NETWORK_RULE\}\}/denied (--no-network)}"
+    profile="${profile//\{\{NETWORK_POLICY\}\}/(deny network*)}"
+  else
+    profile="${profile//\{\{NETWORK_RULE\}\}/allowed (default)}"
+    profile="${profile//\{\{NETWORK_POLICY\}\}/(allow network*)}"
+  fi
+
+  # Extra read-only paths
+  for path in "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}"; do
+    local resolved
+    resolved="$(cd "$path" 2>/dev/null && pwd)" || die "path not found: $path"
+    profile+=$'\n'"(allow file-read* (subpath \"$resolved\"))"
+  done
+
+  # Extra read-write paths
+  for path in "${EXTRA_RW[@]+"${EXTRA_RW[@]}"}"; do
+    local resolved
+    resolved="$(cd "$path" 2>/dev/null && pwd)" || die "path not found: $path"
+    profile+=$'\n'"(allow file-read* file-write* (subpath \"$resolved\"))"
+  done
+
+  echo "$profile"
+}
+
+diff_changes() {
+  local clone="$1"
+  local original="$2"
+
+  # Use rsync dry-run to detect changes
+  local changes
+  changes=$(rsync -rlpn --delete --out-format="%i %n" \
+    --exclude='.zshenv' --exclude='.zshrc' --exclude='.zsh_history' \
+    --exclude='.claude/' --exclude='.cache/' --exclude='.config/' \
+    --exclude='.local/' --exclude='Library/' --exclude='.claude.json' \
+    "$clone/" "$original/" 2>/dev/null | head -50)
+
+  if [[ -z "$changes" ]]; then
+    return 1  # No changes
+  fi
+
+  echo "$changes" | while IFS= read -r line; do
+    local flags="${line%% *}"
+    local file="${line#* }"
+    if [[ "$flags" == *"deleting"* ]]; then
+      echo -e "  ${RED}D${RESET}  $file"
+    elif [[ "$flags" == *"f+++"* ]]; then
+      echo -e "  ${GREEN}A${RESET}  $file"
+    else
+      echo -e "  ${YELLOW}M${RESET}  $file"
+    fi
+  done
+
+  return 0
+}
+
+apply_changes() {
+  local clone="$1"
+  local original="$2"
+
+  rsync -rl --delete \
+    --exclude='.zshenv' --exclude='.zshrc' --exclude='.zsh_history' \
+    --exclude='.claude/' --exclude='.cache/' --exclude='.config/' \
+    --exclude='.local/' --exclude='Library/' --exclude='.claude.json' \
+    "$clone/" "$original/"
+}
+
+cleanup() {
+  if [[ -n "${SANDBOX_PROFILE:-}" && -f "${SANDBOX_PROFILE:-}" ]]; then
+    rm -f "$SANDBOX_PROFILE"
+  fi
+  if [[ -n "${CLONE_DIR:-}" && -d "${CLONE_DIR:-}" ]]; then
+    rm -rf "$CLONE_DIR"
+  fi
+}
+
+# --- Parse Arguments ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow)
+      [[ $# -ge 2 ]] || die "--allow requires a path argument"
+      EXTRA_ALLOW+=("$2"); shift 2 ;;
+    --rw)
+      [[ $# -ge 2 ]] || die "--rw requires a path argument"
+      EXTRA_RW+=("$2"); shift 2 ;;
+    --no-network)
+      NO_NETWORK=true; shift ;;
+    --apply)
+      AUTO_APPLY=true; shift ;;
+    --discard)
+      AUTO_DISCARD=true; shift ;;
+    --dry-run)
+      DRY_RUN=true; shift ;;
+    --verbose)
+      VERBOSE=true; shift ;;
+    --version)
+      echo "parcai $VERSION"; exit 0 ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      die "unknown option: $1" ;;
+  esac
+done
+
+if $AUTO_APPLY && $AUTO_DISCARD; then
+  die "--apply and --discard are mutually exclusive"
+fi
+
+# --- Main ---
+
+check_macos
+
+CWD="$(pwd)"
+HOME_DIR="$HOME"
+PROJECT_NAME="$(basename "$CWD")"
+
+# Create clone (resolve symlinks — macOS /tmp -> /private/tmp, /var -> /private/var)
+CLONE_PARENT="$(mktemp -d)"
+CLONE_PARENT="$(cd "$CLONE_PARENT" && pwd -P)"
+CLONE_DIR="$CLONE_PARENT/$PROJECT_NAME"
+trap cleanup EXIT
+
+info "cloning project (APFS copy-on-write)..."
+create_clone "$CWD" "$CLONE_DIR"
+
+# Create minimal shell config in the clone to prevent errors
+# from the user's .zshenv/.bashrc trying to source inaccessible paths
+cat > "$CLONE_DIR/.zshenv" 2>/dev/null <<'SHELLEOF' || true
+# parcai: minimal env
+SHELLEOF
+
+cat > "$CLONE_DIR/.zshrc" 2>/dev/null <<'SHELLEOF' || true
+# parcai: sandboxed shell
+PS1='[parcai] %1~ %# '
+SHELLEOF
+
+# Generate sandbox profile
+SANDBOX_PROFILE="$(mktemp /tmp/parcai-XXXXXXXX.sb)"
+generate_profile "$CLONE_DIR" "$HOME_DIR" > "$SANDBOX_PROFILE"
+
+if $VERBOSE; then
+  info "clone:   $CLONE_DIR"
+  info "profile: $SANDBOX_PROFILE"
+  info "network: $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
+fi
+
+if $DRY_RUN; then
+  echo ""
+  echo -e "${BOLD}--- Sandbox Profile ---${RESET}"
+  cat "$SANDBOX_PROFILE"
+  echo ""
+  echo -e "${BOLD}--- Clone Directory ---${RESET}"
+  echo "$CLONE_DIR"
+  exit 0
+fi
+
+# Launch sandboxed shell
+info "entering isolated shell..."
+echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$PROJECT_NAME/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+if $NO_NETWORK; then
+  echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
+fi
+echo ""
+
+# Run the sandboxed shell
+# We must cd into the clone BEFORE exec'ing sandbox-exec,
+# because getcwd() fails if CWD is outside the sandbox.
+set +e
+pushd "$CLONE_DIR" > /dev/null 2>&1
+PARCAI=1 \
+PARCAI_BACKEND=sandbox-exec \
+PARCAI_HOST_CWD="$CWD" \
+HOME="$HOME_DIR" \
+ZDOTDIR="$CLONE_DIR" \
+sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
+EXIT_CODE=$?
+popd > /dev/null 2>&1
+set -e
+
+echo ""
+
+# Handle changes
+if diff_changes "$CLONE_DIR" "$CWD" > /dev/null 2>&1; then
+  info "files modified in sandbox:"
+  diff_changes "$CLONE_DIR" "$CWD"
+  echo ""
+
+  if $AUTO_APPLY; then
+    info "applying changes (--apply)..."
+    apply_changes "$CLONE_DIR" "$CWD"
+    info "done."
+  elif $AUTO_DISCARD; then
+    info "discarding changes (--discard)."
+  else
+    echo -ne "${CYAN}parcai:${RESET} apply changes to original project? [y/N] "
+    read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      apply_changes "$CLONE_DIR" "$CWD"
+      info "changes applied."
+    else
+      info "changes discarded."
+    fi
+  fi
+else
+  info "no files modified."
+fi
+
+exit $EXIT_CODE
