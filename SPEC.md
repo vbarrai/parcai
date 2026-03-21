@@ -8,9 +8,10 @@
 
 ```bash
 cd my-project
-parcai            # drops into an isolated shell
-claude            # runs safely — can only touch my-project/
-exit              # back to normal shell
+parcai            # launches claude --dangerously-skip-permissions in a sandbox
+                  # when claude exits, parcai shows changes and asks to apply
+
+parcai --shell    # drops into a plain isolated shell instead
 ```
 
 ## Design Principles
@@ -64,6 +65,7 @@ Options:
   --apply            Auto-apply changes on exit (skip confirmation).
   --discard          Auto-discard changes on exit (skip confirmation).
   --config <file>    Use a specific config file (default: .parcai.json).
+  --shell            Launch a plain shell instead of claude.
   --dry-run          Print the sandbox config without executing.
   --verbose          Show sandbox setup details.
   --help             Show help.

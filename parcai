@@ -19,6 +19,7 @@ ALLOWED_DOMAINS=()
 BLOCKED_DOMAINS=()
 ON_EXIT=""
 ENV_OVERRIDES=()
+SHELL_ONLY=false
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -46,6 +47,7 @@ ${BOLD}Options:${RESET}
   --apply            Auto-apply changes on exit (skip confirmation).
   --discard          Auto-discard changes on exit (skip confirmation).
   --config <file>    Use a specific config file (default: .parcai.json).
+  --shell            Launch a plain shell instead of claude.
   --dry-run          Print the sandbox config without executing.
   --verbose          Show sandbox setup details.
   --help             Show help.
@@ -534,21 +536,35 @@ SHELLEOF
     exit 0
   fi
 
-  # Launch sandboxed shell
-  info "entering isolated shell..."
-  echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+  # Launch sandbox
+  if $SHELL_ONLY; then
+    info "entering isolated shell..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+  else
+    info "launching claude in isolated sandbox..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible."
+  fi
   $NO_NETWORK && echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
   [[ -n "$SECRETS_FILE" ]] && echo -e "${YELLOW}[parcai]${RESET} secrets masked via proxy"
   echo ""
 
   set +e
   pushd "$CLONE_DIR" > /dev/null 2>&1
-  PARCAI=1 \
-  PARCAI_BACKEND=sandbox-exec \
-  PARCAI_HOST_CWD="$cwd" \
-  HOME="$HOME" \
-  ZDOTDIR="$CLONE_DIR" \
-  sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
+  if $SHELL_ONLY; then
+    PARCAI=1 \
+    PARCAI_BACKEND=sandbox-exec \
+    PARCAI_HOST_CWD="$cwd" \
+    HOME="$HOME" \
+    ZDOTDIR="$CLONE_DIR" \
+    sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
+  else
+    PARCAI=1 \
+    PARCAI_BACKEND=sandbox-exec \
+    PARCAI_HOST_CWD="$cwd" \
+    HOME="$HOME" \
+    ZDOTDIR="$CLONE_DIR" \
+    sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -c 'claude --dangerously-skip-permissions'
+  fi
   EXIT_CODE=$?
   popd > /dev/null 2>&1
   set -e
@@ -707,8 +723,13 @@ run_linux() {
     exit 0
   fi
 
-  info "entering isolated shell..."
-  echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+  if $SHELL_ONLY; then
+    info "entering isolated shell..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+  else
+    info "launching claude in isolated sandbox..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible."
+  fi
   $NO_NETWORK && echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
   [[ -n "$SECRETS_FILE" ]] && echo -e "${YELLOW}[parcai]${RESET} secrets masked via proxy"
   echo ""
@@ -724,6 +745,8 @@ run_linux() {
     FAKE_ENV="$7"
     EXTRA_RO="$8"
     EXTRA_RW="$9"
+    shift 9
+    SHELL_ONLY="$1"
 
     ROOT="$WORK/root"
     mkdir -p "$ROOT"
@@ -820,7 +843,7 @@ run_linux() {
     umount -l /oldroot 2>/dev/null || true
     rmdir /oldroot 2>/dev/null || true
 
-    # Launch shell
+    # Launch shell or claude
     cd /project
     export HOME=/project
     export PARCAI=1
@@ -828,8 +851,12 @@ run_linux() {
     export PS1="[parcai] \w \$ "
     export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin
     eval "$PROXY_ENV"
-    exec /bin/sh
-  ' _ "$WORK_DIR" "$cwd" "$sess_dir" "$HOME" "$proxy_env" "$SECRETS_FILE" "$WORK_DIR/fake.env" "$extra_ro_mounts" "$extra_rw_mounts"
+    if [ "$SHELL_ONLY" = "true" ]; then
+      exec /bin/sh
+    else
+      claude --dangerously-skip-permissions
+    fi
+  ' _ "$WORK_DIR" "$cwd" "$sess_dir" "$HOME" "$proxy_env" "$SECRETS_FILE" "$WORK_DIR/fake.env" "$extra_ro_mounts" "$extra_rw_mounts" "$SHELL_ONLY"
   EXIT_CODE=$?
   set -e
 
@@ -1041,6 +1068,8 @@ while [[ $# -gt 0 ]]; do
     --config)
       [[ $# -ge 2 ]] || die "--config requires a file argument"
       CONFIG_FILE="$2"; shift 2 ;;
+    --shell)
+      SHELL_ONLY=true; shift ;;
     --dry-run)
       DRY_RUN=true; shift ;;
     --verbose)

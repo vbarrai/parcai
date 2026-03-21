@@ -15,9 +15,8 @@ export PATH="$PWD/parcai:$PATH"
 
 # Use it
 cd my-project
-parcai              # drops into an isolated shell
-claude              # runs safely — can only touch my-project/
-exit                # back to normal shell, changes reviewed before applying
+parcai              # launches claude in a sandbox — can only touch my-project/
+                    # when claude exits, parcai shows changes and asks to apply
 ```
 
 ## How it works
@@ -62,12 +61,21 @@ cd my-project
 parcai
 ```
 
-You get an isolated shell where:
+This launches `claude --dangerously-skip-permissions` inside an isolated sandbox. When claude exits, parcai automatically exits and shows you what changed.
+
+The sandbox ensures:
 - Only `my-project/` is accessible (read + write on a copy)
 - `~/.ssh`, `~/.aws`, `~/.gnupg`, etc. are invisible
 - `$HOME` points to the project directory
 - `$PATH` is restricted to system binaries
-- Shell prompt shows `[parcai]` to remind you
+
+### Shell mode
+
+If you want a plain interactive shell instead of claude:
+
+```bash
+parcai --shell
+```
 
 ### Apply or discard changes
 
