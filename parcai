@@ -15,6 +15,10 @@ SECRETS_FILE=""
 SECRET_LOG=false
 EXTRA_ALLOW=()
 EXTRA_RW=()
+ALLOWED_DOMAINS=()
+BLOCKED_DOMAINS=()
+ON_EXIT=""
+ENV_OVERRIDES=()
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -41,10 +45,16 @@ ${BOLD}Options:${RESET}
   --secret-log       Write proxy audit log to session directory.
   --apply            Auto-apply changes on exit (skip confirmation).
   --discard          Auto-discard changes on exit (skip confirmation).
+  --config <file>    Use a specific config file (default: .parcai.json).
   --dry-run          Print the sandbox config without executing.
   --verbose          Show sandbox setup details.
   --help             Show help.
   --version          Show version.
+
+${BOLD}Config file:${RESET}
+  Place a ${BOLD}.parcai.json${RESET} in your project root to set defaults.
+  Run ${BOLD}parcai init${RESET} to generate a starter config.
+  CLI flags override config file values.
 EOF
 }
 
@@ -61,6 +71,149 @@ warn() {
   echo -e "${YELLOW}parcai:${RESET} $1"
 }
 
+# --- Configuration File ---
+
+CONFIG_FILE=".parcai.json"
+
+# Minimal JSON value extractor (no jq dependency).
+# Handles: strings, booleans, numbers. Does NOT handle nested objects.
+json_value() {
+  local json="$1" key="$2"
+  # Match "key": "value" or "key": value (bool/number)
+  local val
+  val=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  if [[ -n "$val" ]]; then
+    echo "$val"
+    return
+  fi
+  # Try non-string value (bool, number, null)
+  val=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | head -1 | tr -d '[:space:]')
+  echo "$val"
+}
+
+# Extract a JSON array of strings: "key": ["a", "b"] → one per line
+json_array() {
+  local json="$1" key="$2"
+  # Extract the array content between [ and ]
+  local arr
+  arr=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | head -1)
+  [[ -z "$arr" ]] && return
+  # Extract quoted strings
+  echo "$arr" | grep -oE '"[^"]*"' | tr -d '"'
+}
+
+load_config() {
+  local config_path="$1"
+
+  if [[ ! -f "$config_path" ]]; then
+    return 0
+  fi
+
+  $VERBOSE && info "loading config: $config_path"
+
+  local json
+  json=$(cat "$config_path")
+
+  # network
+  local net_val
+  net_val=$(json_value "$json" "network")
+  if [[ "$net_val" == "false" ]]; then
+    NO_NETWORK=true
+  fi
+
+  # secrets
+  local sec_val
+  sec_val=$(json_value "$json" "secrets")
+  if [[ -n "$sec_val" && "$sec_val" != "null" && -z "$SECRETS_FILE" ]]; then
+    SECRETS_FILE="$sec_val"
+  fi
+
+  # secret_log
+  local sl_val
+  sl_val=$(json_value "$json" "secret_log")
+  if [[ "$sl_val" == "true" ]]; then
+    SECRET_LOG=true
+  fi
+
+  # on_exit
+  local oe_val
+  oe_val=$(json_value "$json" "on_exit")
+  if [[ -n "$oe_val" && "$oe_val" != "null" && -z "$ON_EXIT" ]]; then
+    ON_EXIT="$oe_val"
+    case "$ON_EXIT" in
+      apply)   AUTO_APPLY=true ;;
+      discard) AUTO_DISCARD=true ;;
+    esac
+  fi
+
+  # verbose
+  local v_val
+  v_val=$(json_value "$json" "verbose")
+  if [[ "$v_val" == "true" ]]; then
+    VERBOSE=true
+  fi
+
+  # allow (array of paths)
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    EXTRA_ALLOW+=("$p")
+  done < <(json_array "$json" "allow")
+
+  # rw (array of paths)
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    EXTRA_RW+=("$p")
+  done < <(json_array "$json" "rw")
+
+  # allowed_domains (array of domain strings)
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    ALLOWED_DOMAINS+=("$d")
+  done < <(json_array "$json" "allowed_domains")
+
+  # blocked_domains (array of domain strings)
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    BLOCKED_DOMAINS+=("$d")
+  done < <(json_array "$json" "blocked_domains")
+
+  # env (object of KEY=VALUE overrides — parsed as flat key/value pairs)
+  # Supports "env": {"NODE_ENV": "test", "DEBUG": "1"}
+  local env_block
+  env_block=$(echo "$json" | sed -n '/"env"[[:space:]]*:/,/}/p' | tail -n +1)
+  if [[ -n "$env_block" ]]; then
+    while IFS= read -r pair; do
+      [[ -z "$pair" ]] && continue
+      local ekey eval_
+      ekey=$(echo "$pair" | sed -n 's/.*"\([^"]*\)"[[:space:]]*:.*/\1/p')
+      eval_=$(echo "$pair" | sed -n 's/.*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      if [[ -n "$ekey" && -n "$eval_" && "$ekey" != "env" ]]; then
+        ENV_OVERRIDES+=("${ekey}=${eval_}")
+      fi
+    done <<< "$env_block"
+  fi
+}
+
+generate_default_config() {
+  cat <<'CONFIGEOF'
+{
+  "network": true,
+  "secrets": null,
+  "secret_log": false,
+  "on_exit": "ask",
+  "verbose": false,
+
+  "allow": [],
+  "rw": [],
+
+  "allowed_domains": [],
+  "blocked_domains": [],
+
+  "env": {}
+}
+CONFIGEOF
+}
+
 # --- Platform Detection ---
 
 detect_platform() {
@@ -69,6 +222,44 @@ detect_platform() {
     Linux)  echo "linux" ;;
     *)      die "unsupported platform: $(uname -s)" ;;
   esac
+}
+
+# --- Environment & Domain Injection ---
+
+# Write env overrides and domain-filter env vars into a shell config file.
+# Called for both macOS (.zshenv) and Linux (inline export).
+inject_env_into_shell_config() {
+  local target_file="$1"
+
+  # Env overrides from config
+  for entry in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
+    local key="${entry%%=*}"
+    local val="${entry#*=}"
+    echo "export ${key}=\"${val}\"" >> "$target_file"
+  done
+
+  # Domain filtering — exported as env vars for the proxy or iptables wrapper
+  if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${ALLOWED_DOMAINS[*]}")
+    echo "export PARCAI_ALLOWED_DOMAINS=\"${joined}\"" >> "$target_file"
+  fi
+
+  if [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${BLOCKED_DOMAINS[*]}")
+    echo "export PARCAI_BLOCKED_DOMAINS=\"${joined}\"" >> "$target_file"
+  fi
+}
+
+# Generate iptables rules to restrict DNS-resolved outbound to allowed domains.
+# On Linux with --net namespace, we can insert iptables rules.
+# Returns a shell snippet to eval inside the namespace.
+generate_domain_iptables() {
+  # Domain filtering via iptables is complex (requires resolving at sandbox start).
+  # Instead, we pass domain lists to the proxy which does the filtering.
+  # If no proxy, we set env vars and rely on the agent respecting them.
+  :
 }
 
 # --- Session Persistence ---
@@ -312,6 +503,9 @@ PROXYEOF
 # parcai: minimal env
 SHELLEOF
 
+  # Inject env overrides and domain config
+  inject_env_into_shell_config "$CLONE_DIR/.zshenv"
+
   cat > "$CLONE_DIR/.zshrc" 2>/dev/null <<'SHELLEOF' || true
 # parcai: sandboxed shell
 PS1='[parcai] %1~ %# '
@@ -464,6 +658,25 @@ run_linux() {
     proxy_env="export HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT}; export HTTP_PROXY=http://127.0.0.1:${PROXY_PORT};"
   fi
 
+  # Add env overrides from config
+  for entry in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
+    local key="${entry%%=*}"
+    local val="${entry#*=}"
+    proxy_env="${proxy_env} export ${key}=\"${val}\";"
+  done
+
+  # Add domain filtering env vars
+  if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${ALLOWED_DOMAINS[*]}")
+    proxy_env="${proxy_env} export PARCAI_ALLOWED_DOMAINS=\"${joined}\";"
+  fi
+  if [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${BLOCKED_DOMAINS[*]}")
+    proxy_env="${proxy_env} export PARCAI_BLOCKED_DOMAINS=\"${joined}\";"
+  fi
+
   local extra_ro_mounts=""
   for path in "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}"; do
     local resolved
@@ -487,6 +700,9 @@ run_linux() {
     echo "session dir:   $sess_dir"
     echo "network:       $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
     [[ -n "$SECRETS_FILE" ]] && echo "secrets:       active"
+    [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]] && echo "allowed domains: ${ALLOWED_DOMAINS[*]}"
+    [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]] && echo "blocked domains: ${BLOCKED_DOMAINS[*]}"
+    [[ ${#ENV_OVERRIDES[@]} -gt 0 ]] && echo "env overrides: ${ENV_OVERRIDES[*]}"
     cleanup_linux "$proxy_pid"
     exit 0
   fi
@@ -790,6 +1006,19 @@ handle_changes() {
 
 # --- Parse Arguments ---
 
+# Handle subcommands first
+if [[ "${1:-}" == "init" ]]; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    warn ".parcai.json already exists"
+    echo -ne "${CYAN}parcai:${RESET} overwrite? [y/N] "
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || exit 0
+  fi
+  generate_default_config > "$CONFIG_FILE"
+  info "created .parcai.json"
+  exit 0
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --allow)
@@ -809,6 +1038,9 @@ while [[ $# -gt 0 ]]; do
       AUTO_APPLY=true; shift ;;
     --discard)
       AUTO_DISCARD=true; shift ;;
+    --config)
+      [[ $# -ge 2 ]] || die "--config requires a file argument"
+      CONFIG_FILE="$2"; shift 2 ;;
     --dry-run)
       DRY_RUN=true; shift ;;
     --verbose)
@@ -832,6 +1064,15 @@ fi
 
 # --- Main ---
 
+# Load config file (before platform dispatch, after CLI parsing)
+# CLI flags have already set variables; load_config only fills unset values
+load_config "$CONFIG_FILE"
+
+# Validate domain config
+if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 && ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+  die "allowed_domains and blocked_domains are mutually exclusive"
+fi
+
 PLATFORM=$(detect_platform)
 CWD="$(pwd)"
 SESS_DIR=$(session_dir "$CWD")
@@ -842,6 +1083,10 @@ mkdir -p "$SESS_DIR"
 if $VERBOSE; then
   info "platform: $PLATFORM"
   info "project:  $CWD"
+  [[ -f "$CONFIG_FILE" ]] && info "config:   $CONFIG_FILE"
+  [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]] && info "allowed domains: ${ALLOWED_DOMAINS[*]}"
+  [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]] && info "blocked domains: ${BLOCKED_DOMAINS[*]}"
+  [[ ${#ENV_OVERRIDES[@]} -gt 0 ]] && info "env overrides: ${ENV_OVERRIDES[*]}"
 fi
 
 case "$PLATFORM" in
