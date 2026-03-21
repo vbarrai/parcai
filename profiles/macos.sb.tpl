@@ -91,8 +91,8 @@
 ;; ============================================================
 (deny process-info*)
 (allow process-info* (target self))
-(allow process-info-pidinfo)
-(allow process-info-pidfdinfo)
+(allow process-info-pidinfo (target self))
+(allow process-info-pidfdinfo (target self))
 
 ;; ============================================================
 ;; NETWORK
