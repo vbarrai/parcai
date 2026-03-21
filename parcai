@@ -255,15 +255,15 @@ if $DRY_RUN; then
   exit 0
 fi
 
-# Launch sandboxed shell
-info "entering isolated shell..."
-echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$PROJECT_NAME/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+# Launch sandboxed Claude
+info "launching Claude in sandbox..."
+echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$PROJECT_NAME/${RESET} is accessible."
 if $NO_NETWORK; then
   echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
 fi
 echo ""
 
-# Run the sandboxed shell
+# Run Claude directly inside the sandbox
 # We must cd into the clone BEFORE exec'ing sandbox-exec,
 # because getcwd() fails if CWD is outside the sandbox.
 set +e
@@ -272,8 +272,7 @@ PARCAI=1 \
 PARCAI_BACKEND=sandbox-exec \
 PARCAI_HOST_CWD="$CWD" \
 HOME="$HOME_DIR" \
-ZDOTDIR="$CLONE_DIR" \
-sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
+sandbox-exec -f "$SANDBOX_PROFILE" claude --dangerously-skip-permissions
 EXIT_CODE=$?
 popd > /dev/null 2>&1
 set -e
