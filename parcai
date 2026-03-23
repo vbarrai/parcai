@@ -11,8 +11,15 @@ DRY_RUN=false
 VERBOSE=false
 AUTO_APPLY=false
 AUTO_DISCARD=false
+SECRETS_FILE=""
+SECRET_LOG=false
 EXTRA_ALLOW=()
 EXTRA_RW=()
+ALLOWED_DOMAINS=()
+BLOCKED_DOMAINS=()
+ON_EXIT=""
+ENV_OVERRIDES=()
+SHELL_ONLY=false
 
 # --- Colors ---
 RED='\033[0;31m'
@@ -35,12 +42,21 @@ ${BOLD}Options:${RESET}
   --allow <path>     Additional path to whitelist (read-only). Repeatable.
   --rw <path>        Additional path to whitelist (read-write). Repeatable.
   --no-network       Deny all network access inside the sandbox.
+  --secrets <file>   Enable secret masking proxy using secrets from <file>.
+  --secret-log       Write proxy audit log to session directory.
   --apply            Auto-apply changes on exit (skip confirmation).
   --discard          Auto-discard changes on exit (skip confirmation).
+  --config <file>    Use a specific config file (default: .parcai.json).
+  --shell            Launch a plain shell instead of claude.
   --dry-run          Print the sandbox config without executing.
   --verbose          Show sandbox setup details.
   --help             Show help.
   --version          Show version.
+
+${BOLD}Config file:${RESET}
+  Place a ${BOLD}.parcai.json${RESET} in your project root to set defaults.
+  Run ${BOLD}parcai init${RESET} to generate a starter config.
+  CLI flags override config file values.
 EOF
 }
 
@@ -57,8 +73,312 @@ warn() {
   echo -e "${YELLOW}parcai:${RESET} $1"
 }
 
+# --- Configuration File ---
+
+CONFIG_FILE=".parcai.json"
+
+# Minimal JSON value extractor (no jq dependency).
+# Handles: strings, booleans, numbers. Does NOT handle nested objects.
+json_value() {
+  local json="$1" key="$2"
+  # Match "key": "value" or "key": value (bool/number)
+  local val
+  val=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  if [[ -n "$val" ]]; then
+    echo "$val"
+    return
+  fi
+  # Try non-string value (bool, number, null)
+  val=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' | head -1 | tr -d '[:space:]')
+  echo "$val"
+}
+
+# Extract a JSON array of strings: "key": ["a", "b"] → one per line
+json_array() {
+  local json="$1" key="$2"
+  # Extract the array content between [ and ]
+  local arr
+  arr=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | head -1)
+  [[ -z "$arr" ]] && return
+  # Extract quoted strings
+  echo "$arr" | grep -oE '"[^"]*"' | tr -d '"'
+}
+
+load_config() {
+  local config_path="$1"
+
+  if [[ ! -f "$config_path" ]]; then
+    return 0
+  fi
+
+  $VERBOSE && info "loading config: $config_path"
+
+  local json
+  json=$(cat "$config_path")
+
+  # network
+  local net_val
+  net_val=$(json_value "$json" "network")
+  if [[ "$net_val" == "false" ]]; then
+    NO_NETWORK=true
+  fi
+
+  # secrets
+  local sec_val
+  sec_val=$(json_value "$json" "secrets")
+  if [[ -n "$sec_val" && "$sec_val" != "null" && -z "$SECRETS_FILE" ]]; then
+    SECRETS_FILE="$sec_val"
+  fi
+
+  # secret_log
+  local sl_val
+  sl_val=$(json_value "$json" "secret_log")
+  if [[ "$sl_val" == "true" ]]; then
+    SECRET_LOG=true
+  fi
+
+  # on_exit
+  local oe_val
+  oe_val=$(json_value "$json" "on_exit")
+  if [[ -n "$oe_val" && "$oe_val" != "null" && -z "$ON_EXIT" ]]; then
+    ON_EXIT="$oe_val"
+    case "$ON_EXIT" in
+      apply)   AUTO_APPLY=true ;;
+      discard) AUTO_DISCARD=true ;;
+    esac
+  fi
+
+  # verbose
+  local v_val
+  v_val=$(json_value "$json" "verbose")
+  if [[ "$v_val" == "true" ]]; then
+    VERBOSE=true
+  fi
+
+  # allow (array of paths)
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    EXTRA_ALLOW+=("$p")
+  done < <(json_array "$json" "allow")
+
+  # rw (array of paths)
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    EXTRA_RW+=("$p")
+  done < <(json_array "$json" "rw")
+
+  # allowed_domains (array of domain strings)
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    ALLOWED_DOMAINS+=("$d")
+  done < <(json_array "$json" "allowed_domains")
+
+  # blocked_domains (array of domain strings)
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    BLOCKED_DOMAINS+=("$d")
+  done < <(json_array "$json" "blocked_domains")
+
+  # env (object of KEY=VALUE overrides — parsed as flat key/value pairs)
+  # Supports "env": {"NODE_ENV": "test", "DEBUG": "1"}
+  local env_block
+  env_block=$(echo "$json" | sed -n '/"env"[[:space:]]*:/,/}/p' | tail -n +1)
+  if [[ -n "$env_block" ]]; then
+    while IFS= read -r pair; do
+      [[ -z "$pair" ]] && continue
+      local ekey eval_
+      ekey=$(echo "$pair" | sed -n 's/.*"\([^"]*\)"[[:space:]]*:.*/\1/p')
+      eval_=$(echo "$pair" | sed -n 's/.*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      if [[ -n "$ekey" && -n "$eval_" && "$ekey" != "env" ]]; then
+        ENV_OVERRIDES+=("${ekey}=${eval_}")
+      fi
+    done <<< "$env_block"
+  fi
+}
+
+generate_default_config() {
+  cat <<'CONFIGEOF'
+{
+  "network": true,
+  "secrets": null,
+  "secret_log": false,
+  "on_exit": "ask",
+  "verbose": false,
+
+  "allow": [],
+  "rw": [],
+
+  "allowed_domains": [],
+  "blocked_domains": [],
+
+  "env": {}
+}
+CONFIGEOF
+}
+
+# --- Platform Detection ---
+
+detect_platform() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux)  echo "linux" ;;
+    *)      die "unsupported platform: $(uname -s)" ;;
+  esac
+}
+
+# --- Environment & Domain Injection ---
+
+# Write env overrides and domain-filter env vars into a shell config file.
+# Called for both macOS (.zshenv) and Linux (inline export).
+inject_env_into_shell_config() {
+  local target_file="$1"
+
+  # Env overrides from config
+  for entry in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
+    local key="${entry%%=*}"
+    local val="${entry#*=}"
+    echo "export ${key}=\"${val}\"" >> "$target_file"
+  done
+
+  # Domain filtering — exported as env vars for the proxy or iptables wrapper
+  if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${ALLOWED_DOMAINS[*]}")
+    echo "export PARCAI_ALLOWED_DOMAINS=\"${joined}\"" >> "$target_file"
+  fi
+
+  if [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${BLOCKED_DOMAINS[*]}")
+    echo "export PARCAI_BLOCKED_DOMAINS=\"${joined}\"" >> "$target_file"
+  fi
+}
+
+# Generate iptables rules to restrict DNS-resolved outbound to allowed domains.
+# On Linux with --net namespace, we can insert iptables rules.
+# Returns a shell snippet to eval inside the namespace.
+generate_domain_iptables() {
+  # Domain filtering via iptables is complex (requires resolving at sandbox start).
+  # Instead, we pass domain lists to the proxy which does the filtering.
+  # If no proxy, we set env vars and rely on the agent respecting them.
+  :
+}
+
+# --- Session Persistence ---
+
+session_dir() {
+  local cwd="$1"
+  local hash
+  hash=$(printf '%s' "$cwd" | sha256sum 2>/dev/null || printf '%s' "$cwd" | shasum -a 256 2>/dev/null)
+  hash="${hash%% *}"
+  hash="${hash:0:12}"
+  echo "$HOME/.parcai/sessions/$hash"
+}
+
+persist_claude_config() {
+  local clone="$1"
+  local sess_dir="$2"
+
+  if [[ ! -d "$clone/.claude" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$sess_dir/claude-config"
+
+  # Persist only what we need: credentials, settings, CLAUDE.md, json configs
+  for item in credentials settings.json settings.local.json CLAUDE.md; do
+    if [[ -f "$clone/.claude/$item" ]]; then
+      cp "$clone/.claude/$item" "$sess_dir/claude-config/"
+    fi
+  done
+
+  # Copy any other .json config files (not projects/ or logs)
+  find "$clone/.claude" -maxdepth 1 -name '*.json' -exec cp {} "$sess_dir/claude-config/" \; 2>/dev/null || true
+}
+
+inject_claude_config() {
+  local clone="$1"
+  local sess_dir="$2"
+
+  mkdir -p "$clone/.claude"
+
+  if [[ -d "$sess_dir/claude-config" ]]; then
+    # Subsequent run: restore persisted config
+    cp -r "$sess_dir/claude-config/." "$clone/.claude/"
+  else
+    # First run: copy only credentials from global ~/.claude
+    if [[ -f "$HOME/.claude/credentials" ]]; then
+      cp "$HOME/.claude/credentials" "$clone/.claude/"
+    elif [[ -f "$HOME/.claude/credentials.json" ]]; then
+      cp "$HOME/.claude/credentials.json" "$clone/.claude/"
+    fi
+  fi
+}
+
+# --- Secret Masking ---
+
+generate_fake_token() {
+  local key_name="$1"
+  local normalized
+  normalized=$(echo "$key_name" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
+  local hex
+  hex=$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  echo "fake_parcai_${normalized}_${hex}"
+}
+
+setup_secrets() {
+  local secrets_file="$1"
+  local clone="$2"
+  local work_dir="$3"
+
+  [[ -f "$secrets_file" ]] || die "secrets file not found: $secrets_file"
+
+  # Parse the secrets file and build fake env + vault
+  local vault_file="$work_dir/vault.json"
+  local fake_env="$work_dir/fake.env"
+
+  echo "{" > "$vault_file"
+  : > "$fake_env"
+
+  local first=true
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip comments and empty lines
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    # Parse KEY=VALUE
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local value="${BASH_REMATCH[2]}"
+      # Strip surrounding quotes
+      value="${value#\"}"
+      value="${value%\"}"
+      value="${value#\'}"
+      value="${value%\'}"
+
+      local fake_token
+      fake_token=$(generate_fake_token "$key")
+
+      if ! $first; then
+        echo "," >> "$vault_file"
+      fi
+      first=false
+      printf '  "%s": {"real": "%s", "key": "%s"}' "$fake_token" "$value" "$key" >> "$vault_file"
+
+      echo "${key}=${fake_token}" >> "$fake_env"
+    fi
+  done < "$secrets_file"
+
+  echo "" >> "$vault_file"
+  echo "}" >> "$vault_file"
+
+  # Replace .env in the clone with the fake version
+  cp "$fake_env" "$clone/.env"
+
+  echo "$vault_file"
+}
+
+# --- macOS Backend ---
+
 check_macos() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "parcai currently only supports macOS"
   command -v sandbox-exec >/dev/null 2>&1 || die "sandbox-exec not found"
 }
 
@@ -73,16 +393,13 @@ check_apfs() {
   return 0
 }
 
-create_clone() {
+create_clone_macos() {
   local src="$1"
   local dst="$2"
 
   if check_apfs "$src" 2>/dev/null; then
-    # APFS clone: instant, zero disk cost
     cp -c -R "$src" "$dst" 2>/dev/null && return 0
   fi
-
-  # Fallback: regular copy
   cp -R "$src" "$dst"
 }
 
@@ -106,6 +423,15 @@ generate_profile() {
     profile="${profile//\{\{NETWORK_POLICY\}\}/(allow network*)}"
   fi
 
+  # Proxy loopback rule
+  if [[ -n "$SECRETS_FILE" && -n "${PROXY_PORT:-}" ]]; then
+    local loopback_rule
+    loopback_rule="(allow network-outbound (local tcp \"*:${PROXY_PORT}\"))"
+    profile="${profile//\{\{PROXY_LOOPBACK_RULE\}\}/$loopback_rule}"
+  else
+    profile="${profile//\{\{PROXY_LOOPBACK_RULE\}\}/}"
+  fi
+
   # Extra read-only paths
   for path in "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}"; do
     local resolved
@@ -123,20 +449,527 @@ generate_profile() {
   echo "$profile"
 }
 
+run_macos() {
+  local cwd="$1"
+  local sess_dir="$2"
+
+  check_macos
+
+  local project_name
+  project_name="$(basename "$cwd")"
+
+  # Create clone (resolve symlinks — macOS /tmp -> /private/tmp)
+  local clone_parent
+  clone_parent="$(mktemp -d)"
+  clone_parent="$(cd "$clone_parent" && pwd -P)"
+  CLONE_DIR="$clone_parent/$project_name"
+
+  info "cloning project (APFS copy-on-write)..."
+  create_clone_macos "$cwd" "$CLONE_DIR"
+
+  # Inject Claude config
+  inject_claude_config "$CLONE_DIR" "$sess_dir"
+
+  # Setup secrets if requested
+  local proxy_pid=""
+  if [[ -n "$SECRETS_FILE" ]]; then
+    local proxy_bin="$SCRIPT_DIR/proxy/parcai-proxy"
+    if [[ -x "$proxy_bin" ]]; then
+      local work_dir
+      work_dir="$(mktemp -d)"
+      setup_secrets "$SECRETS_FILE" "$CLONE_DIR" "$work_dir"
+
+      # Start proxy
+      local proxy_args=("start" "--port" "0" "--vault" "$work_dir/vault.json")
+      if $SECRET_LOG; then
+        proxy_args+=("--log" "$sess_dir/proxy.log")
+      fi
+      PROXY_PORT=$("$proxy_bin" "${proxy_args[@]}" 2>/dev/null | grep -oE 'PORT=[0-9]+' | cut -d= -f2)
+      proxy_pid=$!
+
+      # Inject proxy env into clone
+      cat >> "$CLONE_DIR/.zshenv" <<PROXYEOF
+export HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT}
+export HTTP_PROXY=http://127.0.0.1:${PROXY_PORT}
+export NODE_EXTRA_CA_CERTS=/tmp/parcai-proxy-ca.crt
+PROXYEOF
+    else
+      warn "parcai-proxy binary not found — --secrets requires proxy/parcai-proxy"
+      warn "continuing without secret masking"
+      SECRETS_FILE=""
+    fi
+  fi
+
+  # Create minimal shell config in the clone
+  cat > "$CLONE_DIR/.zshenv" 2>/dev/null <<'SHELLEOF' || true
+# parcai: minimal env
+SHELLEOF
+
+  # Inject env overrides and domain config
+  inject_env_into_shell_config "$CLONE_DIR/.zshenv"
+
+  cat > "$CLONE_DIR/.zshrc" 2>/dev/null <<'SHELLEOF' || true
+# parcai: sandboxed shell
+PS1='[parcai] %1~ %# '
+SHELLEOF
+
+  # Generate sandbox profile
+  SANDBOX_PROFILE="$(mktemp /tmp/parcai-XXXXXXXX.sb)"
+  generate_profile "$CLONE_DIR" "$HOME" > "$SANDBOX_PROFILE"
+
+  if $VERBOSE; then
+    info "clone:   $CLONE_DIR"
+    info "session: $sess_dir"
+    info "profile: $SANDBOX_PROFILE"
+    info "network: $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
+    [[ -n "$SECRETS_FILE" ]] && info "secrets: active (proxy port ${PROXY_PORT:-n/a})"
+  fi
+
+  if $DRY_RUN; then
+    echo ""
+    echo -e "${BOLD}--- Sandbox Profile ---${RESET}"
+    cat "$SANDBOX_PROFILE"
+    echo ""
+    echo -e "${BOLD}--- Clone Directory ---${RESET}"
+    echo "$CLONE_DIR"
+    cleanup_macos "$proxy_pid"
+    exit 0
+  fi
+
+  # Launch sandbox
+  if $SHELL_ONLY; then
+    info "entering isolated shell..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+  else
+    info "launching claude in isolated sandbox..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible."
+  fi
+  $NO_NETWORK && echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
+  [[ -n "$SECRETS_FILE" ]] && echo -e "${YELLOW}[parcai]${RESET} secrets masked via proxy"
+  echo ""
+
+  set +e
+  pushd "$CLONE_DIR" > /dev/null 2>&1
+  if $SHELL_ONLY; then
+    PARCAI=1 \
+    PARCAI_BACKEND=sandbox-exec \
+    PARCAI_HOST_CWD="$cwd" \
+    HOME="$HOME" \
+    ZDOTDIR="$CLONE_DIR" \
+    sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
+  else
+    PARCAI=1 \
+    PARCAI_BACKEND=sandbox-exec \
+    PARCAI_HOST_CWD="$cwd" \
+    HOME="$HOME" \
+    ZDOTDIR="$CLONE_DIR" \
+    sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -c 'claude --dangerously-skip-permissions'
+  fi
+  EXIT_CODE=$?
+  popd > /dev/null 2>&1
+  set -e
+
+  echo ""
+
+  # Persist Claude config (always, silently)
+  persist_claude_config "$CLONE_DIR" "$sess_dir"
+
+  # Handle project changes
+  handle_changes "$CLONE_DIR" "$cwd"
+
+  # Cleanup
+  cleanup_macos "$proxy_pid"
+
+  return $EXIT_CODE
+}
+
+cleanup_macos() {
+  local proxy_pid="${1:-}"
+
+  if [[ -n "$proxy_pid" ]]; then
+    kill "$proxy_pid" 2>/dev/null || true
+  fi
+  if [[ -n "${SANDBOX_PROFILE:-}" && -f "${SANDBOX_PROFILE:-}" ]]; then
+    rm -f "$SANDBOX_PROFILE"
+  fi
+  if [[ -n "${CLONE_DIR:-}" && -d "${CLONE_DIR:-}" ]]; then
+    rm -rf "$CLONE_DIR"
+  fi
+}
+
+# --- Linux Backend ---
+
+check_linux() {
+  # Check for unshare
+  command -v unshare >/dev/null 2>&1 || die "unshare not found (install util-linux)"
+
+  # Check if user namespaces are available
+  if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+    local val
+    val=$(cat /proc/sys/kernel/unprivileged_userns_clone)
+    if [[ "$val" != "1" ]]; then
+      warn "unprivileged user namespaces disabled (kernel.unprivileged_userns_clone=0)"
+      warn "some isolation features may require root"
+    fi
+  fi
+}
+
+supports_overlayfs() {
+  # Check if overlayfs is available for unprivileged users (kernel >= 5.11)
+  if [[ -d /sys/module/overlay ]] || grep -q overlay /proc/filesystems 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+run_linux() {
+  local cwd="$1"
+  local sess_dir="$2"
+
+  check_linux
+
+  local project_name
+  project_name="$(basename "$cwd")"
+
+  # Work directory for overlay layers
+  WORK_DIR="$(mktemp -d /tmp/parcai-XXXXXXXX)"
+
+  # Setup secrets if requested
+  local proxy_pid=""
+  local vault_file=""
+  if [[ -n "$SECRETS_FILE" ]]; then
+    local proxy_bin="$SCRIPT_DIR/proxy/parcai-proxy"
+    if [[ -x "$proxy_bin" ]]; then
+      vault_file=$(setup_secrets "$SECRETS_FILE" "$WORK_DIR/clone-stub" "$WORK_DIR")
+
+      local proxy_args=("start" "--port" "0" "--vault" "$vault_file")
+      if $SECRET_LOG; then
+        proxy_args+=("--log" "$sess_dir/proxy.log")
+      fi
+      PROXY_PORT=$("$proxy_bin" "${proxy_args[@]}" 2>/dev/null | grep -oE 'PORT=[0-9]+' | cut -d= -f2)
+      proxy_pid=$!
+    else
+      warn "parcai-proxy binary not found — --secrets requires proxy/parcai-proxy"
+      warn "continuing without secret masking"
+      SECRETS_FILE=""
+    fi
+  fi
+
+  if $VERBOSE; then
+    info "work:    $WORK_DIR"
+    info "session: $sess_dir"
+    info "network: $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
+    [[ -n "$SECRETS_FILE" ]] && info "secrets: active (proxy port ${PROXY_PORT:-n/a})"
+  fi
+
+  # Build the unshare command
+  local unshare_flags="--mount --pid --fork --map-root-user"
+  if $NO_NETWORK; then
+    unshare_flags="$unshare_flags --net"
+  fi
+
+  # Prepare env vars for inner script
+  local proxy_env=""
+  if [[ -n "$SECRETS_FILE" && -n "${PROXY_PORT:-}" ]]; then
+    proxy_env="export HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT}; export HTTP_PROXY=http://127.0.0.1:${PROXY_PORT};"
+  fi
+
+  # Add env overrides from config
+  for entry in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
+    local key="${entry%%=*}"
+    local val="${entry#*=}"
+    proxy_env="${proxy_env} export ${key}=\"${val}\";"
+  done
+
+  # Add domain filtering env vars
+  if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${ALLOWED_DOMAINS[*]}")
+    proxy_env="${proxy_env} export PARCAI_ALLOWED_DOMAINS=\"${joined}\";"
+  fi
+  if [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+    local joined
+    joined=$(IFS=,; echo "${BLOCKED_DOMAINS[*]}")
+    proxy_env="${proxy_env} export PARCAI_BLOCKED_DOMAINS=\"${joined}\";"
+  fi
+
+  local extra_ro_mounts=""
+  for path in "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}"; do
+    local resolved
+    resolved="$(cd "$path" 2>/dev/null && pwd)" || die "path not found: $path"
+    extra_ro_mounts="$extra_ro_mounts $resolved"
+  done
+
+  local extra_rw_mounts=""
+  for path in "${EXTRA_RW[@]+"${EXTRA_RW[@]}"}"; do
+    local resolved
+    resolved="$(cd "$path" 2>/dev/null && pwd)" || die "path not found: $path"
+    extra_rw_mounts="$extra_rw_mounts $resolved"
+  done
+
+  if $DRY_RUN; then
+    echo ""
+    echo -e "${BOLD}--- Linux Sandbox Config ---${RESET}"
+    echo "unshare flags: $unshare_flags"
+    echo "project:       $cwd"
+    echo "work dir:      $WORK_DIR"
+    echo "session dir:   $sess_dir"
+    echo "network:       $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
+    [[ -n "$SECRETS_FILE" ]] && echo "secrets:       active"
+    [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]] && echo "allowed domains: ${ALLOWED_DOMAINS[*]}"
+    [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]] && echo "blocked domains: ${BLOCKED_DOMAINS[*]}"
+    [[ ${#ENV_OVERRIDES[@]} -gt 0 ]] && echo "env overrides: ${ENV_OVERRIDES[*]}"
+    cleanup_linux "$proxy_pid"
+    exit 0
+  fi
+
+  if $SHELL_ONLY; then
+    info "entering isolated shell..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
+  else
+    info "launching claude in isolated sandbox..."
+    echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible."
+  fi
+  $NO_NETWORK && echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
+  [[ -n "$SECRETS_FILE" ]] && echo -e "${YELLOW}[parcai]${RESET} secrets masked via proxy"
+  echo ""
+
+  set +e
+  unshare $unshare_flags -- /bin/sh -c '
+    WORK="$1"
+    CWD="$2"
+    SESS_DIR="$3"
+    REAL_HOME="$4"
+    PROXY_ENV="$5"
+    SECRETS_FILE="$6"
+    FAKE_ENV="$7"
+    EXTRA_RO="$8"
+    EXTRA_RW="$9"
+    shift 9
+    SHELL_ONLY="$1"
+
+    ROOT="$WORK/root"
+    mkdir -p "$ROOT"
+
+    # Try overlayfs first
+    USE_OVERLAY=false
+    mkdir -p "$WORK/upper" "$WORK/workdir" "$WORK/merged"
+    if mount -t tmpfs tmpfs "$WORK/upper" 2>/dev/null; then
+      mkdir -p "$WORK/upper/upper" "$WORK/upper/work"
+      if mount -t overlay overlay \
+        -o "lowerdir=$CWD,upperdir=$WORK/upper/upper,workdir=$WORK/upper/work" \
+        "$WORK/merged" 2>/dev/null; then
+        USE_OVERLAY=true
+      fi
+    fi
+
+    # Bind-mount system dirs read-only
+    for dir in usr lib lib64 bin sbin; do
+      if [ -d "/$dir" ]; then
+        mkdir -p "$ROOT/$dir"
+        mount --bind "/$dir" "$ROOT/$dir"
+        mount -o remount,bind,ro "$ROOT/$dir"
+      fi
+    done
+
+    # /etc: bind-mount read-only (needed for DNS, TLS certs)
+    if [ -d /etc ]; then
+      mkdir -p "$ROOT/etc"
+      mount --bind /etc "$ROOT/etc"
+      mount -o remount,bind,ro "$ROOT/etc"
+    fi
+
+    # Proc, dev, tmp
+    mkdir -p "$ROOT/proc" "$ROOT/dev" "$ROOT/tmp"
+    mount -t proc proc "$ROOT/proc"
+    mount -t tmpfs tmpfs "$ROOT/dev"
+    mount -t tmpfs tmpfs "$ROOT/tmp"
+
+    # Create essential device nodes
+    mknod -m 666 "$ROOT/dev/null" c 1 3 2>/dev/null || true
+    mknod -m 666 "$ROOT/dev/zero" c 1 5 2>/dev/null || true
+    mknod -m 666 "$ROOT/dev/random" c 1 8 2>/dev/null || true
+    mknod -m 666 "$ROOT/dev/urandom" c 1 9 2>/dev/null || true
+    mknod -m 666 "$ROOT/dev/tty" c 5 0 2>/dev/null || true
+    mkdir -p "$ROOT/dev/pts" 2>/dev/null || true
+    mount -t devpts devpts "$ROOT/dev/pts" 2>/dev/null || true
+
+    # Mount project
+    mkdir -p "$ROOT/project"
+    if [ "$USE_OVERLAY" = "true" ]; then
+      mount --move "$WORK/merged" "$ROOT/project"
+    else
+      mount --bind "$CWD" "$ROOT/project"
+    fi
+
+    # Inject Claude config
+    mkdir -p "$ROOT/project/.claude"
+    if [ -d "$SESS_DIR/claude-config" ]; then
+      cp -r "$SESS_DIR/claude-config/." "$ROOT/project/.claude/"
+    elif [ -f "$REAL_HOME/.claude/credentials" ]; then
+      cp "$REAL_HOME/.claude/credentials" "$ROOT/project/.claude/" 2>/dev/null || true
+    elif [ -f "$REAL_HOME/.claude/credentials.json" ]; then
+      cp "$REAL_HOME/.claude/credentials.json" "$ROOT/project/.claude/" 2>/dev/null || true
+    fi
+
+    # If --secrets: replace .env with fake
+    if [ -n "$SECRETS_FILE" ] && [ -f "$FAKE_ENV" ]; then
+      cp "$FAKE_ENV" "$ROOT/project/.env"
+    fi
+
+    # Extra read-only bind mounts
+    for p in $EXTRA_RO; do
+      if [ -d "$p" ]; then
+        local_mount="$ROOT$p"
+        mkdir -p "$local_mount"
+        mount --bind "$p" "$local_mount"
+        mount -o remount,bind,ro "$local_mount"
+      fi
+    done
+
+    # Extra read-write bind mounts
+    for p in $EXTRA_RW; do
+      if [ -d "$p" ]; then
+        local_mount="$ROOT$p"
+        mkdir -p "$local_mount"
+        mount --bind "$p" "$local_mount"
+      fi
+    done
+
+    # pivot_root: swap root filesystem
+    mkdir -p "$ROOT/oldroot"
+    cd "$ROOT"
+    pivot_root . oldroot
+    umount -l /oldroot 2>/dev/null || true
+    rmdir /oldroot 2>/dev/null || true
+
+    # Launch shell or claude
+    cd /project
+    export HOME=/project
+    export PARCAI=1
+    export PARCAI_BACKEND=unshare
+    export PS1="[parcai] \w \$ "
+    export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin
+    eval "$PROXY_ENV"
+    if [ "$SHELL_ONLY" = "true" ]; then
+      exec /bin/sh
+    else
+      claude --dangerously-skip-permissions
+    fi
+  ' _ "$WORK_DIR" "$cwd" "$sess_dir" "$HOME" "$proxy_env" "$SECRETS_FILE" "$WORK_DIR/fake.env" "$extra_ro_mounts" "$extra_rw_mounts" "$SHELL_ONLY"
+  EXIT_CODE=$?
+  set -e
+
+  echo ""
+
+  # Persist Claude config from overlay upper layer
+  if [[ -d "$WORK_DIR/upper/upper/.claude" ]]; then
+    mkdir -p "$sess_dir/claude-config"
+    cp -r "$WORK_DIR/upper/upper/.claude/." "$sess_dir/claude-config/" 2>/dev/null || true
+    # Clean up non-persistent files
+    rm -rf "$sess_dir/claude-config/projects" 2>/dev/null || true
+    rm -f "$sess_dir/claude-config/"*.log 2>/dev/null || true
+  fi
+
+  # Handle project changes
+  handle_changes_linux "$cwd"
+
+  # Cleanup
+  cleanup_linux "$proxy_pid"
+
+  return $EXIT_CODE
+}
+
+handle_changes_linux() {
+  local original="$1"
+
+  # Check for changes in the overlay upper layer
+  if [[ ! -d "$WORK_DIR/upper/upper" ]]; then
+    info "no files modified."
+    return 0
+  fi
+
+  # List changed files (exclude .claude, .env if secrets active)
+  local changes
+  changes=$(find "$WORK_DIR/upper/upper" -type f \
+    ! -path '*/.claude/*' \
+    ! -path '*/.wh..claude' \
+    $([ -n "$SECRETS_FILE" ] && echo "! -name .env") \
+    2>/dev/null | sed "s|$WORK_DIR/upper/upper/||" | head -50)
+
+  if [[ -z "$changes" ]]; then
+    info "no files modified."
+    return 0
+  fi
+
+  info "files modified in sandbox:"
+  echo "$changes" | while IFS= read -r file; do
+    if [[ -f "$original/$file" ]]; then
+      echo -e "  ${YELLOW}M${RESET}  $file"
+    else
+      echo -e "  ${GREEN}A${RESET}  $file"
+    fi
+  done
+  echo ""
+
+  if $AUTO_APPLY; then
+    info "applying changes (--apply)..."
+    apply_overlay_changes "$original"
+    info "done."
+  elif $AUTO_DISCARD; then
+    info "discarding changes (--discard)."
+  else
+    echo -ne "${CYAN}parcai:${RESET} apply changes to original project? [y/N] "
+    read -r answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      apply_overlay_changes "$original"
+      info "changes applied."
+    else
+      info "changes discarded."
+    fi
+  fi
+}
+
+apply_overlay_changes() {
+  local original="$1"
+
+  local exclude_args=(--exclude '.claude/')
+  [[ -n "$SECRETS_FILE" ]] && exclude_args+=(--exclude '.env')
+
+  rsync -rl "${exclude_args[@]}" "$WORK_DIR/upper/upper/" "$original/"
+}
+
+cleanup_linux() {
+  local proxy_pid="${1:-}"
+
+  if [[ -n "$proxy_pid" ]]; then
+    kill "$proxy_pid" 2>/dev/null || true
+  fi
+  if [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
+}
+
+# --- Shared: Change Handling (macOS) ---
+
 diff_changes() {
   local clone="$1"
   local original="$2"
 
-  # Use rsync dry-run to detect changes
+  local exclude_args=(
+    --exclude='.zshenv' --exclude='.zshrc' --exclude='.zsh_history'
+    --exclude='.claude/' --exclude='.cache/' --exclude='.config/'
+    --exclude='.local/' --exclude='Library/' --exclude='.claude.json'
+  )
+  [[ -n "$SECRETS_FILE" ]] && exclude_args+=(--exclude='.env')
+
   local changes
   changes=$(rsync -rlpn --delete --out-format="%i %n" \
-    --exclude='.zshenv' --exclude='.zshrc' --exclude='.zsh_history' \
-    --exclude='.claude/' --exclude='.cache/' --exclude='.config/' \
-    --exclude='.local/' --exclude='Library/' --exclude='.claude.json' \
+    "${exclude_args[@]}" \
     "$clone/" "$original/" 2>/dev/null | head -50)
 
   if [[ -z "$changes" ]]; then
-    return 1  # No changes
+    return 1
   fi
 
   echo "$changes" | while IFS= read -r line; do
@@ -158,23 +991,60 @@ apply_changes() {
   local clone="$1"
   local original="$2"
 
-  rsync -rl --delete \
-    --exclude='.zshenv' --exclude='.zshrc' --exclude='.zsh_history' \
-    --exclude='.claude/' --exclude='.cache/' --exclude='.config/' \
-    --exclude='.local/' --exclude='Library/' --exclude='.claude.json' \
-    "$clone/" "$original/"
+  local exclude_args=(
+    --exclude='.zshenv' --exclude='.zshrc' --exclude='.zsh_history'
+    --exclude='.claude/' --exclude='.cache/' --exclude='.config/'
+    --exclude='.local/' --exclude='Library/' --exclude='.claude.json'
+  )
+  [[ -n "$SECRETS_FILE" ]] && exclude_args+=(--exclude='.env')
+
+  rsync -rl --delete "${exclude_args[@]}" "$clone/" "$original/"
 }
 
-cleanup() {
-  if [[ -n "${SANDBOX_PROFILE:-}" && -f "${SANDBOX_PROFILE:-}" ]]; then
-    rm -f "$SANDBOX_PROFILE"
-  fi
-  if [[ -n "${CLONE_DIR:-}" && -d "${CLONE_DIR:-}" ]]; then
-    rm -rf "$CLONE_DIR"
+handle_changes() {
+  local clone="$1"
+  local original="$2"
+
+  if diff_changes "$clone" "$original" > /dev/null 2>&1; then
+    info "files modified in sandbox:"
+    diff_changes "$clone" "$original"
+    echo ""
+
+    if $AUTO_APPLY; then
+      info "applying changes (--apply)..."
+      apply_changes "$clone" "$original"
+      info "done."
+    elif $AUTO_DISCARD; then
+      info "discarding changes (--discard)."
+    else
+      echo -ne "${CYAN}parcai:${RESET} apply changes to original project? [y/N] "
+      read -r answer
+      if [[ "$answer" =~ ^[Yy]$ ]]; then
+        apply_changes "$clone" "$original"
+        info "changes applied."
+      else
+        info "changes discarded."
+      fi
+    fi
+  else
+    info "no files modified."
   fi
 }
 
 # --- Parse Arguments ---
+
+# Handle subcommands first
+if [[ "${1:-}" == "init" ]]; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    warn ".parcai.json already exists"
+    echo -ne "${CYAN}parcai:${RESET} overwrite? [y/N] "
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || exit 0
+  fi
+  generate_default_config > "$CONFIG_FILE"
+  info "created .parcai.json"
+  exit 0
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -186,10 +1056,20 @@ while [[ $# -gt 0 ]]; do
       EXTRA_RW+=("$2"); shift 2 ;;
     --no-network)
       NO_NETWORK=true; shift ;;
+    --secrets)
+      [[ $# -ge 2 ]] || die "--secrets requires a file argument"
+      SECRETS_FILE="$2"; shift 2 ;;
+    --secret-log)
+      SECRET_LOG=true; shift ;;
     --apply)
       AUTO_APPLY=true; shift ;;
     --discard)
       AUTO_DISCARD=true; shift ;;
+    --config)
+      [[ $# -ge 2 ]] || die "--config requires a file argument"
+      CONFIG_FILE="$2"; shift 2 ;;
+    --shell)
+      SHELL_ONLY=true; shift ;;
     --dry-run)
       DRY_RUN=true; shift ;;
     --verbose)
@@ -207,103 +1087,44 @@ if $AUTO_APPLY && $AUTO_DISCARD; then
   die "--apply and --discard are mutually exclusive"
 fi
 
+if $SECRET_LOG && [[ -z "$SECRETS_FILE" ]]; then
+  die "--secret-log requires --secrets"
+fi
+
 # --- Main ---
 
-check_macos
+# Load config file (before platform dispatch, after CLI parsing)
+# CLI flags have already set variables; load_config only fills unset values
+load_config "$CONFIG_FILE"
 
+# Validate domain config
+if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 && ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+  die "allowed_domains and blocked_domains are mutually exclusive"
+fi
+
+PLATFORM=$(detect_platform)
 CWD="$(pwd)"
-HOME_DIR="$HOME"
-PROJECT_NAME="$(basename "$CWD")"
+SESS_DIR=$(session_dir "$CWD")
+EXIT_CODE=0
 
-# Create clone (resolve symlinks — macOS /tmp -> /private/tmp, /var -> /private/var)
-CLONE_PARENT="$(mktemp -d)"
-CLONE_PARENT="$(cd "$CLONE_PARENT" && pwd -P)"
-CLONE_DIR="$CLONE_PARENT/$PROJECT_NAME"
-trap cleanup EXIT
-
-info "cloning project (APFS copy-on-write)..."
-create_clone "$CWD" "$CLONE_DIR"
-
-# Create minimal shell config in the clone to prevent errors
-# from the user's .zshenv/.bashrc trying to source inaccessible paths
-cat > "$CLONE_DIR/.zshenv" 2>/dev/null <<'SHELLEOF' || true
-# parcai: minimal env
-SHELLEOF
-
-cat > "$CLONE_DIR/.zshrc" 2>/dev/null <<'SHELLEOF' || true
-# parcai: sandboxed shell
-PS1='[parcai] %1~ %# '
-SHELLEOF
-
-# Generate sandbox profile
-SANDBOX_PROFILE="$(mktemp /tmp/parcai-XXXXXXXX.sb)"
-generate_profile "$CLONE_DIR" "$HOME_DIR" > "$SANDBOX_PROFILE"
+mkdir -p "$SESS_DIR"
 
 if $VERBOSE; then
-  info "clone:   $CLONE_DIR"
-  info "profile: $SANDBOX_PROFILE"
-  info "network: $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
+  info "platform: $PLATFORM"
+  info "project:  $CWD"
+  [[ -f "$CONFIG_FILE" ]] && info "config:   $CONFIG_FILE"
+  [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]] && info "allowed domains: ${ALLOWED_DOMAINS[*]}"
+  [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]] && info "blocked domains: ${BLOCKED_DOMAINS[*]}"
+  [[ ${#ENV_OVERRIDES[@]} -gt 0 ]] && info "env overrides: ${ENV_OVERRIDES[*]}"
 fi
 
-if $DRY_RUN; then
-  echo ""
-  echo -e "${BOLD}--- Sandbox Profile ---${RESET}"
-  cat "$SANDBOX_PROFILE"
-  echo ""
-  echo -e "${BOLD}--- Clone Directory ---${RESET}"
-  echo "$CLONE_DIR"
-  exit 0
-fi
-
-# Launch sandboxed shell
-info "entering isolated shell..."
-echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$PROJECT_NAME/${RESET} is accessible. Type ${BOLD}exit${RESET} to leave."
-if $NO_NETWORK; then
-  echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
-fi
-echo ""
-
-# Run the sandboxed shell
-# We must cd into the clone BEFORE exec'ing sandbox-exec,
-# because getcwd() fails if CWD is outside the sandbox.
-set +e
-pushd "$CLONE_DIR" > /dev/null 2>&1
-PARCAI=1 \
-PARCAI_BACKEND=sandbox-exec \
-PARCAI_HOST_CWD="$CWD" \
-HOME="$HOME_DIR" \
-ZDOTDIR="$CLONE_DIR" \
-sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
-EXIT_CODE=$?
-popd > /dev/null 2>&1
-set -e
-
-echo ""
-
-# Handle changes
-if diff_changes "$CLONE_DIR" "$CWD" > /dev/null 2>&1; then
-  info "files modified in sandbox:"
-  diff_changes "$CLONE_DIR" "$CWD"
-  echo ""
-
-  if $AUTO_APPLY; then
-    info "applying changes (--apply)..."
-    apply_changes "$CLONE_DIR" "$CWD"
-    info "done."
-  elif $AUTO_DISCARD; then
-    info "discarding changes (--discard)."
-  else
-    echo -ne "${CYAN}parcai:${RESET} apply changes to original project? [y/N] "
-    read -r answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      apply_changes "$CLONE_DIR" "$CWD"
-      info "changes applied."
-    else
-      info "changes discarded."
-    fi
-  fi
-else
-  info "no files modified."
-fi
+case "$PLATFORM" in
+  macos)
+    run_macos "$CWD" "$SESS_DIR"
+    ;;
+  linux)
+    run_linux "$CWD" "$SESS_DIR"
+    ;;
+esac
 
 exit $EXIT_CODE
