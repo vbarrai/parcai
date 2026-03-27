@@ -66,20 +66,68 @@
 ;; ============================================================
 ;; DENY sensitive paths explicitly (overrides the broad home read)
 ;; ============================================================
+;; --- Credentials & secrets ---
 (deny file-read* file-write*
   (subpath "{{HOME}}/.ssh")
   (subpath "{{HOME}}/.aws")
   (subpath "{{HOME}}/.gnupg")
-  (subpath "{{HOME}}/.config/gcloud")
   (subpath "{{HOME}}/.kube")
   (subpath "{{HOME}}/.docker")
   (subpath "{{HOME}}/.claude")
+  (literal "{{HOME}}/.env")
+  (literal "{{HOME}}/.netrc")
+  (literal "{{HOME}}/.npmrc")
+  (literal "{{HOME}}/.git-credentials"))
+
+;; --- Cloud provider configs ---
+(deny file-read* file-write*
+  (subpath "{{HOME}}/.config/gcloud")
+  (subpath "{{HOME}}/.config/gh")
+  (subpath "{{HOME}}/.config/op")
+  (subpath "{{HOME}}/.azure")
+  (subpath "{{HOME}}/.oci")
+  (subpath "{{HOME}}/.terraform.d"))
+
+;; --- Package manager configs (may contain tokens) ---
+(deny file-read* file-write*
+  (subpath "{{HOME}}/.cargo")
+  (subpath "{{HOME}}/.npm")
+  (subpath "{{HOME}}/.bun")
+  (subpath "{{HOME}}/.nvm")
+  (subpath "{{HOME}}/.pyenv")
+  (subpath "{{HOME}}/.gem")
+  (subpath "{{HOME}}/.m2")
+  (subpath "{{HOME}}/.gradle"))
+
+;; --- Personal folders ---
+(deny file-read* file-write*
   (subpath "{{HOME}}/Documents")
   (subpath "{{HOME}}/Desktop")
   (subpath "{{HOME}}/Downloads")
-  (literal "{{HOME}}/.env")
-  (literal "{{HOME}}/.netrc")
-  (literal "{{HOME}}/.npmrc"))
+  (subpath "{{HOME}}/Pictures")
+  (subpath "{{HOME}}/Movies")
+  (subpath "{{HOME}}/Music"))
+
+;; --- Shell history (may contain secrets typed in commands) ---
+(deny file-read* file-write*
+  (literal "{{HOME}}/.zsh_history")
+  (literal "{{HOME}}/.bash_history")
+  (literal "{{HOME}}/.sh_history")
+  (literal "{{HOME}}/.node_repl_history")
+  (literal "{{HOME}}/.python_history")
+  (literal "{{HOME}}/.psql_history")
+  (literal "{{HOME}}/.mysql_history")
+  (literal "{{HOME}}/.irb_history")
+  (literal "{{HOME}}/.lesshst"))
+
+;; --- Other projects (prevent cross-project access) ---
+(deny file-read* file-write*
+  (subpath "{{HOME}}/Workspace")
+  (subpath "{{HOME}}/Projects")
+  (subpath "{{HOME}}/repos")
+  (subpath "{{HOME}}/src")
+  (subpath "{{HOME}}/code")
+  (subpath "{{HOME}}/dev"))
 
 ;; Temp + device write access
 (allow file-write* (subpath "/private/tmp") (subpath "/tmp"))

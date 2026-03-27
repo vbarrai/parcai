@@ -1,0 +1,628 @@
+#!/usr/bin/env node
+// parcai-proxy — MITM proxy for secret masking
+// Replaces fake tokens with real ones on outbound requests,
+// and real tokens with fake ones on inbound responses.
+// Zero external dependencies — Node.js stdlib only.
+
+"use strict";
+
+const http = require("http");
+const https = require("https");
+const tls = require("tls");
+const net = require("net");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const { URL } = require("url");
+
+// ─── CLI Parsing ────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const args = {
+    port: 0,
+    vault: null,
+    log: null,
+    caDir: path.join(
+      process.env.HOME || "/tmp",
+      ".parcai",
+      "ca"
+    ),
+    caCert: "/tmp/parcai-proxy-ca.crt",
+    foreground: false,
+    allowedDomains: [],
+    blockedDomains: [],
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case "start":
+        break;
+      case "--port":
+        args.port = parseInt(argv[++i], 10);
+        break;
+      case "--vault":
+        args.vault = argv[++i];
+        break;
+      case "--log":
+        args.log = argv[++i];
+        break;
+      case "--ca-dir":
+        args.caDir = argv[++i];
+        break;
+      case "--ca-cert":
+        args.caCert = argv[++i];
+        break;
+      case "--foreground":
+        args.foreground = true;
+        break;
+      case "--allowed-domains":
+        args.allowedDomains = argv[++i].split(",").map((d) => d.trim()).filter(Boolean);
+        break;
+      case "--blocked-domains":
+        args.blockedDomains = argv[++i].split(",").map((d) => d.trim()).filter(Boolean);
+        break;
+    }
+  }
+
+  if (!args.vault) {
+    process.stderr.write("error: --vault is required\n");
+    process.exit(1);
+  }
+
+  return args;
+}
+
+// ─── Domain Filtering ───────────────────────────────────────────
+
+function isDomainAllowed(hostname, args) {
+  if (args.allowedDomains.length > 0) {
+    // Allowlist mode: only these domains are permitted
+    return args.allowedDomains.some((d) => hostname === d || hostname.endsWith("." + d));
+  }
+  if (args.blockedDomains.length > 0) {
+    // Blocklist mode: these domains are rejected
+    return !args.blockedDomains.some((d) => hostname === d || hostname.endsWith("." + d));
+  }
+  // No filtering configured
+  return true;
+}
+
+// ─── Vault ──────────────────────────────────────────────────────
+
+function loadVault(vaultPath) {
+  const raw = JSON.parse(fs.readFileSync(vaultPath, "utf8"));
+  const fakeToReal = {};
+  const realToFake = {};
+
+  for (const [fakeToken, entry] of Object.entries(raw)) {
+    fakeToReal[fakeToken] = entry;
+    realToFake[entry.real] = fakeToken;
+  }
+
+  // Sort by length descending (longest match first)
+  const fakeTokens = Object.keys(fakeToReal).sort(
+    (a, b) => b.length - a.length
+  );
+  const realTokens = Object.keys(realToFake).sort(
+    (a, b) => b.length - a.length
+  );
+
+  return { fakeToReal, realToFake, fakeTokens, realTokens };
+}
+
+function replaceFakeWithReal(vault, text) {
+  let result = text;
+  for (const fake of vault.fakeTokens) {
+    result = result.split(fake).join(vault.fakeToReal[fake].real);
+  }
+  return result;
+}
+
+function replaceRealWithFake(vault, text) {
+  let result = text;
+  for (const real of vault.realTokens) {
+    result = result.split(real).join(vault.realToFake[real]);
+  }
+  return result;
+}
+
+// ─── Audit Logger ───────────────────────────────────────────────
+
+function createLogger(logPath) {
+  if (!logPath) return null;
+  const fd = fs.openSync(logPath, "a");
+  return {
+    write(obj) {
+      fs.writeSync(fd, JSON.stringify(obj) + "\n");
+    },
+    logRequest(method, host, urlPath, proto) {
+      this.write({
+        ts: new Date().toISOString(),
+        type: "request",
+        method,
+        host,
+        path: urlPath,
+        proto,
+      });
+    },
+    logSwap(dir, keyName, host, urlPath) {
+      this.write({
+        ts: new Date().toISOString(),
+        type: "swap",
+        dir,
+        key: keyName,
+        host,
+        path: urlPath,
+      });
+    },
+    logSwaps(dir, vault, original, replaced, host, urlPath) {
+      if (original === replaced) return;
+      const tokens =
+        dir === "outbound" ? vault.fakeTokens : vault.realTokens;
+      for (const token of tokens) {
+        if (original.includes(token) && !replaced.includes(token)) {
+          const keyName =
+            dir === "outbound"
+              ? vault.fakeToReal[token].key
+              : vault.fakeToReal[vault.realToFake[token]]
+                ? vault.fakeToReal[vault.realToFake[token]].key
+                : token.substring(0, 20);
+          this.logSwap(dir, keyName, host, urlPath);
+        }
+      }
+    },
+    close() {
+      fs.closeSync(fd);
+    },
+  };
+}
+
+// ─── CA Certificate ─────────────────────────────────────────────
+
+function ensureCA(caDir, caCertDest) {
+  fs.mkdirSync(caDir, { recursive: true });
+
+  const caKeyPath = path.join(caDir, "ca.key");
+  const caCertPath = path.join(caDir, "ca.crt");
+
+  if (fs.existsSync(caKeyPath) && fs.existsSync(caCertPath)) {
+    const caKeyPem = fs.readFileSync(caKeyPath, "utf8");
+    const caCertPem = fs.readFileSync(caCertPath, "utf8");
+    const caKey = crypto.createPrivateKey(caKeyPem);
+    fs.copyFileSync(caCertPath, caCertDest);
+    return { caKey, caCertPem };
+  }
+
+  // Generate new CA via openssl
+  const { privateKey } = crypto.generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+
+  const caKeyPem = privateKey.export({ type: "pkcs8", format: "pem" });
+  const caCertPem = createSelfSignedCA(privateKey);
+
+  fs.writeFileSync(caKeyPath, caKeyPem, { mode: 0o600 });
+  fs.writeFileSync(caCertPath, caCertPem, { mode: 0o644 });
+  fs.copyFileSync(caCertPath, caCertDest);
+
+  return { caKey: privateKey, caCertPem };
+}
+
+function createSelfSignedCA(privateKey) {
+  // Use the low-level crypto API to create a self-signed cert
+  // Node.js 22+ has crypto.X509Certificate but not a builder.
+  // We'll use a minimal ASN.1/DER approach via openssl-compatible method.
+
+  // Actually, Node 22 doesn't have a native X509 builder.
+  // We'll generate via a child process using openssl, or build DER manually.
+  // For simplicity and zero-dep, let's build a minimal self-signed cert.
+
+  const { execSync } = require("child_process");
+
+  const tmpKey = "/tmp/parcai-ca-tmp.key";
+  const tmpCert = "/tmp/parcai-ca-tmp.crt";
+
+  fs.writeFileSync(
+    tmpKey,
+    privateKey.export({ type: "pkcs8", format: "pem" }),
+    { mode: 0o600 }
+  );
+
+  execSync(
+    `openssl req -new -x509 -key "${tmpKey}" -out "${tmpCert}" ` +
+      `-days 3650 -subj "/CN=parcai-proxy CA" -addext "basicConstraints=critical,CA:TRUE" ` +
+      `-addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null`
+  );
+
+  const certPem = fs.readFileSync(tmpCert, "utf8");
+  fs.unlinkSync(tmpKey);
+  fs.unlinkSync(tmpCert);
+  return certPem;
+}
+
+function generateLeafCert(hostname, caKey, caCertPem) {
+  const { execSync } = require("child_process");
+
+  const leafKey = crypto.generateKeyPairSync("ec", {
+    namedCurve: "prime256v1",
+  });
+
+  const tmpLeafKey = `/tmp/parcai-leaf-${process.pid}.key`;
+  const tmpLeafCsr = `/tmp/parcai-leaf-${process.pid}.csr`;
+  const tmpLeafCert = `/tmp/parcai-leaf-${process.pid}.crt`;
+  const tmpCaKey = `/tmp/parcai-cakey-${process.pid}.pem`;
+  const tmpCaCert = `/tmp/parcai-cacert-${process.pid}.pem`;
+  const tmpExt = `/tmp/parcai-ext-${process.pid}.cnf`;
+
+  try {
+    fs.writeFileSync(
+      tmpLeafKey,
+      leafKey.privateKey.export({ type: "pkcs8", format: "pem" }),
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(
+      tmpCaKey,
+      caKey.export({ type: "pkcs8", format: "pem" }),
+      { mode: 0o600 }
+    );
+    fs.writeFileSync(tmpCaCert, caCertPem);
+    fs.writeFileSync(
+      tmpExt,
+      `subjectAltName=DNS:${hostname}\nbasicConstraints=CA:FALSE\n`
+    );
+
+    execSync(
+      `openssl req -new -key "${tmpLeafKey}" -out "${tmpLeafCsr}" ` +
+        `-subj "/CN=${hostname}" 2>/dev/null`
+    );
+
+    execSync(
+      `openssl x509 -req -in "${tmpLeafCsr}" -CA "${tmpCaCert}" -CAkey "${tmpCaKey}" ` +
+        `-CAcreateserial -out "${tmpLeafCert}" -days 365 ` +
+        `-extfile "${tmpExt}" 2>/dev/null`
+    );
+
+    const certPem = fs.readFileSync(tmpLeafCert, "utf8");
+    return {
+      key: leafKey.privateKey.export({ type: "pkcs8", format: "pem" }),
+      cert: certPem,
+    };
+  } finally {
+    for (const f of [
+      tmpLeafKey, tmpLeafCsr, tmpLeafCert, tmpCaKey, tmpCaCert, tmpExt,
+      tmpCaCert + ".srl",
+    ]) {
+      try { fs.unlinkSync(f); } catch {}
+    }
+  }
+}
+
+// ─── Cert Cache ─────────────────────────────────────────────────
+
+function createCertCache(caKey, caCertPem) {
+  const cache = new Map();
+
+  return {
+    get(hostname) {
+      if (cache.has(hostname)) return cache.get(hostname);
+      const leaf = generateLeafCert(hostname, caKey, caCertPem);
+      cache.set(hostname, leaf);
+      return leaf;
+    },
+  };
+}
+
+// ─── Proxy Server ───────────────────────────────────────────────
+
+function startProxy(args, vault, ca, certCache, logger) {
+  const server = http.createServer();
+
+  // Handle regular HTTP requests (non-CONNECT)
+  server.on("request", (clientReq, clientRes) => {
+    handleHttpRequest(clientReq, clientRes, vault, logger, args);
+  });
+
+  // Handle CONNECT for HTTPS MITM
+  server.on("connect", (req, clientSocket, head) => {
+    handleConnect(req, clientSocket, head, vault, ca, certCache, logger, args);
+  });
+
+  server.listen(args.port, "127.0.0.1", () => {
+    const addr = server.address();
+    process.stdout.write(`PORT=${addr.port}\nPID=${process.pid}\n`);
+
+    // Close stdout so the parent shell's $() returns
+    if (!args.foreground) {
+      try {
+        fs.closeSync(1);
+      } catch {}
+    }
+  });
+
+  // Graceful shutdown
+  process.on("SIGTERM", () => {
+    server.close();
+    if (logger) logger.close();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    server.close();
+    if (logger) logger.close();
+    process.exit(0);
+  });
+
+  return server;
+}
+
+// ─── HTTP (plain) Request Handler ───────────────────────────────
+
+function handleHttpRequest(clientReq, clientRes, vault, logger, args) {
+  const targetUrl = new URL(clientReq.url);
+
+  if (!isDomainAllowed(targetUrl.hostname, args)) {
+    if (logger) logger.logRequest(clientReq.method, targetUrl.hostname, targetUrl.pathname, "http:blocked");
+    clientRes.writeHead(403);
+    clientRes.end(`parcai-proxy: domain "${targetUrl.hostname}" is not allowed\n`);
+    return;
+  }
+
+  if (logger) {
+    logger.logRequest(clientReq.method, targetUrl.hostname, targetUrl.pathname, "http");
+  }
+
+  const options = {
+    hostname: targetUrl.hostname,
+    port: targetUrl.port || 80,
+    path: targetUrl.pathname + targetUrl.search,
+    method: clientReq.method,
+    headers: { ...clientReq.headers },
+  };
+
+  // Replace fake tokens in headers
+  replaceHeaderTokens(options.headers, vault, "outbound");
+  delete options.headers["proxy-connection"];
+
+  collectBody(clientReq, (body) => {
+    const replacedBody = replaceFakeWithReal(vault, body);
+
+    if (logger) {
+      logger.logSwaps("outbound", vault, body, replacedBody, targetUrl.hostname, targetUrl.pathname);
+    }
+
+    if (replacedBody !== body) {
+      options.headers["content-length"] = Buffer.byteLength(replacedBody);
+    }
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      collectBody(proxyRes, (resBody) => {
+        const replacedResBody = replaceRealWithFake(vault, resBody);
+
+        if (logger) {
+          logger.logSwaps("inbound", vault, resBody, replacedResBody, targetUrl.hostname, targetUrl.pathname);
+        }
+
+        const headers = { ...proxyRes.headers };
+        replaceHeaderTokens(headers, vault, "inbound");
+        if (replacedResBody !== resBody) {
+          headers["content-length"] = Buffer.byteLength(replacedResBody);
+        }
+        delete headers["transfer-encoding"];
+
+        clientRes.writeHead(proxyRes.statusCode, headers);
+        clientRes.end(replacedResBody);
+      });
+    });
+
+    proxyReq.on("error", (err) => {
+      clientRes.writeHead(502);
+      clientRes.end(`Proxy error: ${err.message}`);
+    });
+
+    proxyReq.end(replacedBody);
+  });
+}
+
+// ─── HTTPS CONNECT (MITM) Handler ───────────────────────────────
+
+function handleConnect(req, clientSocket, head, vault, ca, certCache, logger, args) {
+  const [hostname, port] = req.url.split(":");
+  const targetPort = parseInt(port, 10) || 443;
+
+  if (!isDomainAllowed(hostname, args)) {
+    if (logger) logger.logRequest("CONNECT", hostname, "/", "https:blocked");
+    clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    clientSocket.end();
+    return;
+  }
+
+  // Tell client the tunnel is established
+  clientSocket.write(
+    "HTTP/1.1 200 Connection Established\r\n\r\n"
+  );
+
+  // Get or generate a cert for this hostname
+  const leaf = certCache.get(hostname);
+
+  // Create TLS server-side (facing the client)
+  const tlsServer = new tls.TLSSocket(clientSocket, {
+    isServer: true,
+    key: leaf.key,
+    cert: leaf.cert + ca.caCertPem,
+    // Disable HTTP/2 — force HTTP/1.1
+    ALPNProtocols: ["http/1.1"],
+  });
+
+  if (head && head.length > 0) {
+    tlsServer.unshift(head);
+  }
+
+  // Parse HTTP requests over the TLS connection
+  const mitmServer = http.createServer();
+  mitmServer.on("request", (mitmReq, mitmRes) => {
+    handleMitmRequest(
+      mitmReq, mitmRes, hostname, targetPort, vault, logger
+    );
+  });
+
+  // Pump the TLS socket into the HTTP server
+  mitmServer.emit("connection", tlsServer);
+
+  tlsServer.on("error", () => {
+    clientSocket.destroy();
+  });
+
+  clientSocket.on("error", () => {
+    tlsServer.destroy();
+  });
+}
+
+function handleMitmRequest(mitmReq, mitmRes, hostname, targetPort, vault, logger) {
+  const reqPath = mitmReq.url || "/";
+
+  if (logger) {
+    logger.logRequest(mitmReq.method, hostname, reqPath, "https");
+  }
+
+  const options = {
+    hostname,
+    port: targetPort,
+    path: reqPath,
+    method: mitmReq.method,
+    headers: { ...mitmReq.headers },
+    rejectUnauthorized: true,
+    // Strip accept-encoding to avoid dealing with decompression
+    // This forces the upstream to send uncompressed responses
+  };
+
+  // Replace fake tokens in headers
+  replaceHeaderTokens(options.headers, vault, "outbound");
+  // Force uncompressed response
+  delete options.headers["accept-encoding"];
+  delete options.headers["proxy-connection"];
+
+  collectBody(mitmReq, (body) => {
+    const replacedBody = replaceFakeWithReal(vault, body);
+
+    if (logger) {
+      logger.logSwaps("outbound", vault, body, replacedBody, hostname, reqPath);
+    }
+
+    if (replacedBody !== body) {
+      options.headers["content-length"] = Buffer.byteLength(replacedBody);
+    }
+
+    const proxyReq = https.request(options, (proxyRes) => {
+      collectBody(proxyRes, (resBody) => {
+        const replacedResBody = replaceRealWithFake(vault, resBody);
+
+        if (logger) {
+          logger.logSwaps("inbound", vault, resBody, replacedResBody, hostname, reqPath);
+        }
+
+        const headers = { ...proxyRes.headers };
+        replaceHeaderTokens(headers, vault, "inbound");
+        if (replacedResBody !== resBody) {
+          headers["content-length"] = Buffer.byteLength(replacedResBody);
+        }
+        delete headers["transfer-encoding"];
+
+        mitmRes.writeHead(proxyRes.statusCode, headers);
+        mitmRes.end(replacedResBody);
+      });
+    });
+
+    proxyReq.on("error", (err) => {
+      mitmRes.writeHead(502);
+      mitmRes.end(`Proxy error: ${err.message}`);
+    });
+
+    proxyReq.end(replacedBody);
+  });
+}
+
+// ─── Helpers ────────────────────────────────────────────────────
+
+function collectBody(stream, callback) {
+  const chunks = [];
+  stream.on("data", (chunk) => chunks.push(chunk));
+  stream.on("end", () => callback(Buffer.concat(chunks).toString("utf8")));
+  stream.on("error", () => callback(""));
+}
+
+function replaceHeaderTokens(headers, vault, direction) {
+  const replaceFn =
+    direction === "outbound" ? replaceFakeWithReal : replaceRealWithFake;
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === "string") {
+      headers[key] = replaceFn(vault, value);
+    } else if (Array.isArray(value)) {
+      headers[key] = value.map((v) =>
+        typeof v === "string" ? replaceFn(vault, v) : v
+      );
+    }
+  }
+}
+
+// ─── Main ───────────────────────────────────────────────────────
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+
+  // Daemonize: respawn as detached child so parent shell's $() returns
+  if (!args.foreground && !process.env._PARCAI_PROXY_DAEMONIZED) {
+    const { spawn } = require("child_process");
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      env: { ...process.env, _PARCAI_PROXY_DAEMONIZED: "1" },
+      stdio: ["ignore", "pipe", "ignore"],
+      detached: true,
+    });
+
+    let output = "";
+    child.stdout.on("data", (data) => {
+      output += data.toString();
+      if (output.includes("PORT=") && output.includes("PID=")) {
+        process.stdout.write(output);
+        child.unref();
+        process.exit(0);
+      }
+    });
+    child.on("error", (err) => {
+      process.stderr.write(`parcai-proxy: failed to start: ${err.message}\n`);
+      process.exit(1);
+    });
+    setTimeout(() => {
+      process.stderr.write("parcai-proxy: timed out waiting for startup\n");
+      child.kill();
+      process.exit(1);
+    }, 5000);
+    return;
+  }
+
+  // Load vault
+  const vault = loadVault(args.vault);
+  const tokenCount = Object.keys(vault.fakeToReal).length;
+  process.stderr.write(
+    `parcai-proxy: loaded ${tokenCount} secret(s) from vault\n`
+  );
+
+  // Ensure CA
+  const ca = ensureCA(args.caDir, args.caCert);
+  process.stderr.write(
+    `parcai-proxy: CA cert at ${args.caCert}\n`
+  );
+
+  // Cert cache
+  const certCache = createCertCache(ca.caKey, ca.caCertPem);
+
+  // Logger
+  const logger = createLogger(args.log);
+  if (args.log) {
+    process.stderr.write(`parcai-proxy: audit log at ${args.log}\n`);
+  }
+
+  // Start proxy
+  startProxy(args, vault, ca, certCache, logger);
+}
+
+main();

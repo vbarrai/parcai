@@ -154,16 +154,73 @@ parcai init
 
 ## Secret Masking
 
-The `--secrets <file>` option prevents AI agents from seeing real API keys and credentials. Instead of exposing real values, the agent sees fake placeholder tokens. A local proxy transparently swaps fakes back to real values on outbound API calls.
+The `--secrets <file>` option prevents AI agents from seeing real API keys and credentials. The agent only ever sees fake placeholder tokens. A local MITM proxy transparently swaps fakes to real values on outbound requests, and real values back to fakes on inbound responses.
+
+### Architecture
+
+```
+Claude (sandbox)                    parcai-proxy (host)               Internet
+    │                                    │                               │
+    │  "Authorization: Bearer            │                               │
+    │   fake_parcai_openai_a1b2"         │                               │
+    ├───────────────────────────────────►│                               │
+    │                                    │  "Authorization: Bearer       │
+    │                                    │   sk-real-key-xxx"            │
+    │                                    ├──────────────────────────────►│
+    │                                    │                               │
+    │                                    │  response body contains       │
+    │                                    │  "sk-real-key-xxx"            │
+    │                                    │◄──────────────────────────────┤
+    │  response body contains            │                               │
+    │  "fake_parcai_openai_a1b2"         │                               │
+    │◄───────────────────────────────────┤                               │
+```
 
 ### How it works
 
 1. **Parse** the secrets file (standard `KEY=VALUE` format, like `.env`).
 2. **Generate** a fake token for each key: `fake_parcai_<normalized_key>_<random_hex>`.
-3. **Build a vault** mapping fake tokens to real values.
+3. **Build a vault** (`vault.json`) mapping fake tokens ↔ real values.
 4. **Replace** the project's `.env` with fake values inside the sandbox.
-5. **Start** `parcai-proxy` (a local HTTPS proxy) that intercepts outbound traffic and swaps fake tokens back to real values.
-6. **Set** `HTTPS_PROXY` / `HTTP_PROXY` environment variables so all HTTP traffic routes through the proxy.
+5. **Start** `parcai-proxy` — a Node.js MITM proxy running on the host (outside the sandbox).
+6. **Set** `HTTPS_PROXY` / `HTTP_PROXY` so all traffic routes through the proxy.
+7. **Set** `NODE_EXTRA_CA_CERTS` pointing to the proxy's CA certificate for HTTPS trust.
+
+### MITM Proxy details
+
+`parcai-proxy` is a single-file Node.js script (`proxy/parcai-proxy`) with zero external dependencies.
+
+**HTTP requests**: the proxy intercepts, replaces fake→real in headers and body, forwards to the server, then replaces real→fake in the response before returning to the client.
+
+**HTTPS requests (CONNECT)**: the proxy performs TLS man-in-the-middle:
+1. Accepts the `CONNECT` tunnel request.
+2. Generates a TLS certificate for the target hostname, signed by its own CA.
+3. Performs TLS handshake with the client using the generated cert.
+4. Opens a TLS connection to the real server.
+5. Parses HTTP within the tunnel — same fake→real / real→fake replacement on both directions.
+
+**CA certificate**: auto-generated on first run and stored in `~/.parcai/ca/`. The CA cert is copied to `/tmp/parcai-proxy-ca.crt` and trusted via `NODE_EXTRA_CA_CERTS`.
+
+**HTTP/2**: disabled (forced to HTTP/1.1) to simplify MITM parsing.
+
+**Compression**: `Accept-Encoding` is stripped from outbound requests to force uncompressed responses, avoiding the need to decompress/recompress for token replacement.
+
+### Vault format
+
+```json
+{
+  "fake_parcai_openai_api_key_a1b2c3d4": {
+    "real": "sk-abc123...",
+    "key": "OPENAI_API_KEY"
+  },
+  "fake_parcai_database_url_e5f6a7b8": {
+    "real": "postgres://user:pass@host/db",
+    "key": "DATABASE_URL"
+  }
+}
+```
+
+Tokens are sorted by length (longest first) before replacement to prevent partial matches.
 
 ### Secrets file format
 
@@ -176,45 +233,72 @@ AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 
 ### Proxy audit log
 
-With `--secret-log` (or `"secret_log": true` in config), the proxy writes an audit log to `~/.parcai/sessions/<hash>/proxy.log` tracking which fake tokens were swapped and when.
+With `--secret-log` (or `"secret_log": true` in config), the proxy writes a JSON-lines audit log tracking which secrets were swapped:
+
+```json
+{"ts":"2026-03-27T10:00:00Z","dir":"outbound","key":"OPENAI_API_KEY","host":"api.openai.com","path":"/v1/chat/completions"}
+{"ts":"2026-03-27T10:00:01Z","dir":"inbound","key":"OPENAI_API_KEY","host":"api.openai.com","path":"/v1/chat/completions"}
+```
+
+Token values are **never** logged — only the key name, direction, host, and path.
 
 ### On macOS with `--no-network`
 
 When both `--secrets` and `--no-network` are active, the sandbox profile includes a loopback exception so the agent can still reach the local proxy on `127.0.0.1:<port>`, while all other network access remains blocked.
 
+### Guarantees
+
+| Property | Guaranteed? | Mechanism |
+|---|---|---|
+| Agent never sees real secrets | **Yes** | `.env` replaced with fakes, all responses masked |
+| API calls work normally | **Yes** | Proxy swaps real tokens into outbound requests |
+| Agent cannot bypass proxy | **Yes** | `HTTPS_PROXY`/`HTTP_PROXY` set in sandbox environment |
+| Secrets never logged | **Yes** | Audit log records key names only, never values |
+| HTTPS traffic inspectable | **Yes** | MITM with auto-generated CA cert per hostname |
+
 ---
 
 ## Session Persistence
 
-parcai preserves Claude's configuration across sessions so context, settings, and credentials survive sandbox restarts.
+parcai preserves Claude's configuration across sessions so credentials, settings, and state survive sandbox restarts. The sandbox config is **completely isolated** from the host's `~/.claude` — nothing is ever copied from the host.
 
-### Session directory
+### Persistent Claude home
 
-Each project gets a session directory at:
+All Claude configuration is stored in a dedicated directory:
 
 ```
-~/.parcai/sessions/<hash>/
+~/.parcai/claude-home/
 ```
 
-Where `<hash>` is the first 12 characters of the SHA-256 hash of the project's absolute path.
+This acts as Claude's "home" across all parcai sessions. It contains:
+
+| Path | Content |
+|------|---------|
+| `~/.parcai/claude-home/.claude/` | Credentials, settings, JSON configs |
+| `~/.parcai/claude-home/.claude.json` | Claude state file (startup count, install method, tips, etc.) |
+| `~/.parcai/claude-home/Library/Application Support/claude/` | Native app state |
 
 ### What is persisted
 
-On sandbox exit, the following files from `.claude/` inside the sandbox are copied to the session directory:
+On sandbox exit, these are synced from the clone to `~/.parcai/claude-home/`:
 
-- `credentials` / `credentials.json`
-- `settings.json`
-- `settings.local.json`
-- `CLAUDE.md`
-- Any other `.json` config files
-
-Excluded: `projects/` directory, log files.
+- **`.claude/`**: all files except `projects/`, `debug/`, `file-history/`, `cache/`, `downloads/`, and `*.log`
+- **`.claude.json`**: Claude's global state file
+- **`Library/Application Support/claude/`**: native app data
 
 ### Session lifecycle
 
-1. **First run**: Claude credentials are copied from the global `~/.claude/credentials` into the sandbox.
-2. **Subsequent runs**: The full persisted config is restored from `~/.parcai/sessions/<hash>/claude-config/`.
-3. **On exit**: Any changes to `.claude/` inside the sandbox are saved back to the session directory.
+1. **First run**: `~/.parcai/claude-home/` is empty — Claude starts from scratch, must authenticate.
+2. **On exit**: config synced from clone to `~/.parcai/claude-home/`.
+3. **Subsequent runs**: config restored from `~/.parcai/claude-home/` into clone. No re-authentication needed.
+
+### Per-project session directory
+
+Each project also gets a session directory at `~/.parcai/sessions/<hash>/` (hash = first 12 chars of SHA-256 of project path). Currently used for proxy audit logs when `--secret-log` is active.
+
+### Isolation guarantee
+
+The host's `~/.claude` is **never read** by parcai. It is also **explicitly denied** in the sandbox profile (`deny file-read* file-write* (subpath "{{HOME}}/.claude")`). The sandbox Claude and the host Claude have completely separate configurations.
 
 ---
 
@@ -273,14 +357,14 @@ When `--secrets` is active with `--no-network`, a loopback exception is added:
 ```
 1. CLONE=$(mktemp -d)/$(basename $PWD)       # resolve symlinks (macOS /tmp -> /private/tmp)
 2. cp -c -R $PWD $CLONE                       # APFS clone (falls back to full copy if not APFS)
-3. Inject Claude config from session or global ~/.claude/credentials
-4. Setup secrets (if --secrets): replace .env, start proxy
-5. Create .zshenv/.zshrc with env overrides and domain config
+3. Inject Claude config from ~/.parcai/claude-home/ (or start fresh if first run)
+4. Setup secrets (if --secrets): replace .env, generate vault, start MITM proxy
+5. Resolve claude binary path, create .zshenv (PATH, proxy env) and .zshrc (launch claude)
 6. Generate .sb profile from template (profiles/macos.sb.tpl)
-7. sandbox-exec -f profile.sb /bin/zsh -i     (CWD = CLONE, ZDOTDIR = CLONE)
+7. sandbox-exec -f profile.sb /bin/zsh -i     (HOME = CLONE, ZDOTDIR = CLONE)
 8. On exit:
-   - Persist Claude config to session directory
-   - Show diff (M/A/D) excluding .zshenv, .zshrc, .claude/, .cache/, etc.
+   - Persist Claude config to ~/.parcai/claude-home/
+   - Show diff (M/A/D) excluding .zshenv, .zshrc, .claude/, .cache/, Library/, etc.
    - Ask user: "Apply changes to original? [y/N]" (unless --apply or --discard)
    - If yes: rsync CLONE -> original (excluding sandbox artifacts)
    - Cleanup CLONE, profile, and proxy
@@ -293,9 +377,10 @@ The profile is generated from `profiles/macos.sb.tpl` with these placeholders:
 | Placeholder | Replaced with |
 |---|---|
 | `{{CLONE}}` | Absolute path to the APFS clone directory |
-| `{{HOME}}` | User's real `$HOME` (for shell config read-only access) |
+| `{{HOME}}` | User's real `$HOME` (for deny rules and broad read) |
 | `{{NETWORK_POLICY}}` | `(allow network*)` or `(deny network*)` |
 | `{{PROXY_LOOPBACK_RULE}}` | Loopback exception for proxy, or empty |
+| `{{CLAUDE_EXEC_RULE}}` | `(literal "/path/to/claude")` or empty if `--shell` |
 
 Additional `--allow` paths append `(allow file-read* (subpath "..."))` rules.
 Additional `--rw` paths append `(allow file-read* file-write* (subpath "..."))` rules.
@@ -303,12 +388,15 @@ Additional `--rw` paths append `(allow file-read* file-write* (subpath "..."))` 
 ### Key sandbox rules
 
 - **Deny default**: everything blocked unless explicitly allowed.
-- **Process exec**: restricted to `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/opt/homebrew/bin`, `/usr/local/bin`.
-- **Write access**: only the clone directory (`{{CLONE}}`).
-- **Read-only access**: system libs, `/etc`, `/tmp`, device files, shell dotfiles.
-- **Denied explicitly**: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.claude`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/.env`, `~/.netrc`, `~/.npmrc`.
+- **Process exec**: restricted to `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/opt/homebrew/bin`, `/usr/local/bin`, + claude binary (resolved dynamically).
+- **Write access**: only the clone directory (`{{CLONE}}`) + `/tmp` + `/dev/null`,`/dev/tty`.
+- **Read-only access**: `/` (literal, for path resolution), system paths (`/usr`, `/bin`, `/sbin`, `/opt`, `/Library`, `/System`, `/etc`, `/var`, `/tmp`, `/dev`), **entire user home** `{{HOME}}`.
+- **Denied explicitly** (overrides broad home read): credentials (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.claude`, `~/.env`, `~/.netrc`, `~/.npmrc`, `~/.git-credentials`), cloud configs (`~/.config/gcloud`, `~/.config/gh`, `~/.azure`, `~/.oci`, `~/.terraform.d`), package managers (`~/.cargo`, `~/.npm`, `~/.bun`, `~/.nvm`, `~/.pyenv`, `~/.gem`, `~/.m2`, `~/.gradle`), personal folders (`~/Documents`, `~/Desktop`, `~/Downloads`, `~/Pictures`, `~/Movies`, `~/Music`), shell history files, other project dirs (`~/Workspace`, `~/Projects`, `~/repos`, `~/src`, `~/code`, `~/dev`).
+- **TTY access**: `file-ioctl` on `/dev/tty` and `/dev/ttys*` (needed for setRawMode).
 - **Process visibility**: `deny process-info*` with self-exception.
 - **IPC**: minimal (`ipc-posix-shm`, `mach-lookup`).
+
+**Note:** The broad home read (`subpath {{HOME}}`) is required because Claude needs to resolve symlinks (`~/.local/bin/claude` → `~/.local/share/claude/versions/...`) and access `~/Library/`. Sensitive directories are blocked by explicit deny rules which take precedence.
 
 ### Guarantees
 
@@ -424,7 +512,7 @@ parcai/
   profiles/
     macos.sb.tpl          # sandbox-exec profile template with {{placeholders}}
   proxy/
-    parcai-proxy          # secret masking proxy binary (optional, for --secrets)
+    parcai-proxy          # MITM proxy for secret masking (Node.js, zero deps)
   tests/
     test_isolation.sh     # filesystem/process/network isolation tests
     test_secrets.sh       # secret masking verification tests

@@ -108,21 +108,62 @@ parcai --rw /tmp/results
 
 ### Secret masking
 
-Prevent the agent from ever seeing real API keys:
+parcai masks secrets listed in `.parcai.json`. On first launch, parcai creates a default config that covers common secret files (`.env`, `.env.local`, `.env.production`, `credentials.json`, etc.). Only files that actually exist in your project are masked.
 
 ```bash
-parcai --secrets .env
+parcai              # reads .parcai.json, masks any listed files that exist
 ```
 
-This replaces all values in `.env` with fake tokens (`fake_parcai_openai_api_key_a1b2`). A local proxy transparently swaps fakes back to real values on outbound API calls, so the agent works normally without ever seeing the real secrets.
-
-Enable audit logging with:
+You can also add files via CLI:
 
 ```bash
-parcai --secrets .env --secret-log
+parcai --secrets .env.custom                   # add a specific file
+parcai --secrets .env --secrets .env.local      # add multiple files
 ```
 
-The log is written to `~/.parcai/sessions/<hash>/proxy.log`.
+The secrets files use standard `KEY=VALUE` format:
+
+```bash
+# .env (your real secrets)
+OPENAI_API_KEY=sk-abc123...
+DATABASE_URL=postgres://user:pass@host/db
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+STRIPE_SECRET_KEY=sk_live_...
+```
+
+When parcai starts:
+
+1. Each secret value is replaced by a random fake token (`fake_parcai_openai_api_key_a1b2`). **Tokens are regenerated at every launch** — the agent never sees the same fake twice.
+2. The agent sees only fake tokens in all masked files and in memory.
+3. A local MITM proxy intercepts all HTTP/HTTPS traffic:
+   - **Outbound**: fake tokens are swapped to real values before reaching the API server
+   - **Inbound**: real values in responses are swapped back to fake tokens
+
+The agent works normally without ever seeing the real secrets. HTTPS is intercepted via a per-hostname TLS certificate signed by an auto-generated CA.
+
+You can also configure it in `.parcai.json`:
+
+```json
+{
+  "secrets": [".env", ".env.local"]
+}
+```
+
+Or as a single file:
+
+```json
+{
+  "secrets": ".env.prod"
+}
+```
+
+Enable audit logging to see which secrets are used and when:
+
+```bash
+parcai --secret-log
+```
+
+The log is written to `~/.parcai/sessions/<hash>/proxy.log` and records which keys were swapped, to which hosts, but **never the actual secret values**.
 
 ### Auto-apply or auto-discard
 

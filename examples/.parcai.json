@@ -1,0 +1,37 @@
+{
+  "network": true,
+  "secrets": [
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.development.local",
+    ".env.production",
+    ".env.production.local",
+    ".env.staging",
+    ".env.test",
+    ".env.test.local",
+    ".secrets",
+    ".secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    ".credentials",
+    "credentials.json",
+    "service-account.json",
+    "service-account-key.json",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".docker/config.json"
+  ],
+  "secret_log": false,
+  "on_exit": "ask",
+  "verbose": false,
+
+  "allow": [],
+  "rw": [],
+
+  "allowed_domains": [],
+  "blocked_domains": [],
+
+  "env": {}
+}

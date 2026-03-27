@@ -11,8 +11,9 @@ DRY_RUN=false
 VERBOSE=false
 AUTO_APPLY=false
 AUTO_DISCARD=false
-SECRETS_FILE=""
-SECRET_LOG=false
+SECRETS_FILES=()
+SECRETS_ACTIVE=false
+SECRET_LOG=true
 EXTRA_ALLOW=()
 EXTRA_RW=()
 ALLOWED_DOMAINS=()
@@ -42,7 +43,7 @@ ${BOLD}Options:${RESET}
   --allow <path>     Additional path to whitelist (read-only). Repeatable.
   --rw <path>        Additional path to whitelist (read-write). Repeatable.
   --no-network       Deny all network access inside the sandbox.
-  --secrets <file>   Enable secret masking proxy using secrets from <file>.
+  --secrets <file>   Mask secrets from <file> (repeatable). Default: .env if it exists.
   --secret-log       Write proxy audit log to session directory.
   --apply            Auto-apply changes on exit (skip confirmation).
   --discard          Auto-discard changes on exit (skip confirmation).
@@ -94,11 +95,15 @@ json_value() {
 }
 
 # Extract a JSON array of strings: "key": ["a", "b"] → one per line
+# Handles multi-line arrays by flattening the JSON first
 json_array() {
   local json="$1" key="$2"
+  # Flatten to single line, collapse whitespace
+  local flat
+  flat=$(echo "$json" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')
   # Extract the array content between [ and ]
   local arr
-  arr=$(echo "$json" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | head -1)
+  arr=$(echo "$flat" | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | head -1)
   [[ -z "$arr" ]] && return
   # Extract quoted strings
   echo "$arr" | grep -oE '"[^"]*"' | tr -d '"'
@@ -123,11 +128,21 @@ load_config() {
     NO_NETWORK=true
   fi
 
-  # secrets
-  local sec_val
-  sec_val=$(json_value "$json" "secrets")
-  if [[ -n "$sec_val" && "$sec_val" != "null" && -z "$SECRETS_FILE" ]]; then
-    SECRETS_FILE="$sec_val"
+  # secrets — can be a string or array in config
+  if [[ ${#SECRETS_FILES[@]} -eq 0 ]]; then
+    # Try array first: "secrets": [".env", ".env.prod"]
+    while IFS= read -r sf; do
+      [[ -z "$sf" ]] && continue
+      SECRETS_FILES+=("$sf")
+    done < <(json_array "$json" "secrets")
+    # Fall back to single string: "secrets": ".env"
+    if [[ ${#SECRETS_FILES[@]} -eq 0 ]]; then
+      local sec_val
+      sec_val=$(json_value "$json" "secrets")
+      if [[ -n "$sec_val" && "$sec_val" != "null" ]]; then
+        SECRETS_FILES+=("$sec_val")
+      fi
+    fi
   fi
 
   # secret_log
@@ -200,8 +215,30 @@ generate_default_config() {
   cat <<'CONFIGEOF'
 {
   "network": true,
-  "secrets": null,
-  "secret_log": false,
+  "secrets": [
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.development.local",
+    ".env.production",
+    ".env.production.local",
+    ".env.staging",
+    ".env.test",
+    ".env.test.local",
+    ".secrets",
+    ".secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    ".credentials",
+    "credentials.json",
+    "service-account.json",
+    "service-account-key.json",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".docker/config.json"
+  ],
+  "secret_log": true,
   "on_exit": "ask",
   "verbose": false,
 
@@ -322,52 +359,72 @@ generate_fake_token() {
   echo "fake_parcai_${normalized}_${hex}"
 }
 
+# Setup secrets from one or more files.
+# Generates a single vault.json and replaces each source file in the clone with its fake version.
+# Usage: setup_secrets <clone_dir> <work_dir> <file1> [file2] ...
 setup_secrets() {
-  local secrets_file="$1"
-  local clone="$2"
-  local work_dir="$3"
+  local clone="$1"
+  local work_dir="$2"
+  shift 2
+  local secrets_files=("$@")
 
-  [[ -f "$secrets_file" ]] || die "secrets file not found: $secrets_file"
-
-  # Parse the secrets file and build fake env + vault
   local vault_file="$work_dir/vault.json"
-  local fake_env="$work_dir/fake.env"
-
   echo "{" > "$vault_file"
-  : > "$fake_env"
 
   local first=true
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    # Skip comments and empty lines
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    # Parse KEY=VALUE
-    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-      local key="${BASH_REMATCH[1]}"
-      local value="${BASH_REMATCH[2]}"
-      # Strip surrounding quotes
-      value="${value#\"}"
-      value="${value%\"}"
-      value="${value#\'}"
-      value="${value%\'}"
 
-      local fake_token
-      fake_token=$(generate_fake_token "$key")
+  for secrets_file in "${secrets_files[@]}"; do
+    [[ -f "$secrets_file" ]] || die "secrets file not found: $secrets_file"
 
-      if ! $first; then
-        echo "," >> "$vault_file"
+    local fake_file="$work_dir/fake_$(basename "$secrets_file")"
+    : > "$fake_file"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # Skip comments and empty lines
+      [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+      # Parse KEY=VALUE
+      if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        local key="${BASH_REMATCH[1]}"
+        local value="${BASH_REMATCH[2]}"
+        # Strip surrounding quotes
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+
+        # Skip empty values
+        [[ -z "$value" ]] && { echo "${key}=" >> "$fake_file"; continue; }
+
+        # Skip values too short or too common to mask safely
+        # (they would cause false-positive replacements in API responses)
+        if [[ ${#value} -lt 8 ]] || [[ "$value" =~ ^(true|false|yes|no|on|off|null|none|verbose|debug|info|warn|error|[0-9]+)$ ]]; then
+          echo "${key}=${value}" >> "$fake_file"
+          continue
+        fi
+
+        local fake_token
+        fake_token=$(generate_fake_token "$key")
+
+        if ! $first; then
+          echo "," >> "$vault_file"
+        fi
+        first=false
+        printf '  "%s": {"real": "%s", "key": "%s"}' "$fake_token" "$value" "$key" >> "$vault_file"
+
+        echo "${key}=${fake_token}" >> "$fake_file"
+      else
+        # Preserve non-KEY=VALUE lines (comments, blank lines) as-is
+        echo "$line" >> "$fake_file"
       fi
-      first=false
-      printf '  "%s": {"real": "%s", "key": "%s"}' "$fake_token" "$value" "$key" >> "$vault_file"
+    done < "$secrets_file"
 
-      echo "${key}=${fake_token}" >> "$fake_env"
-    fi
-  done < "$secrets_file"
+    # Replace the file in the clone with the fake version
+    cp "$fake_file" "$clone/$secrets_file"
+    info "masked $(basename "$secrets_file") ($(grep -c 'fake_parcai' "$fake_file" 2>/dev/null || echo 0) secrets)" >&2
+  done
 
   echo "" >> "$vault_file"
   echo "}" >> "$vault_file"
-
-  # Replace .env in the clone with the fake version
-  cp "$fake_env" "$clone/.env"
 
   echo "$vault_file"
 }
@@ -432,7 +489,7 @@ generate_profile() {
   fi
 
   # Proxy loopback rule
-  if [[ -n "$SECRETS_FILE" && -n "${PROXY_PORT:-}" ]]; then
+  if $SECRETS_ACTIVE && [[ -n "${PROXY_PORT:-}" ]]; then
     local loopback_rule
     loopback_rule="(allow network-outbound (local tcp \"*:${PROXY_PORT}\"))"
     profile="${profile//\{\{PROXY_LOOPBACK_RULE\}\}/$loopback_rule}"
@@ -474,37 +531,69 @@ run_macos() {
 
   info "cloning project (APFS copy-on-write)..."
   create_clone_macos "$cwd" "$CLONE_DIR"
+  info "clone: $CLONE_DIR"
 
   # Inject Claude config
+  if [[ -d "$CLAUDE_HOME/.claude" ]]; then
+    info "restoring Claude config from $CLAUDE_HOME"
+  else
+    info "first launch — Claude will start with a fresh config"
+  fi
   inject_claude_config "$CLONE_DIR"
 
-  # Setup secrets if requested
+  # Setup secrets if any files to mask
   local proxy_pid=""
-  if [[ -n "$SECRETS_FILE" ]]; then
+  if [[ ${#SECRETS_FILES[@]} -gt 0 ]]; then
     local proxy_bin="$SCRIPT_DIR/proxy/parcai-proxy"
     if [[ -x "$proxy_bin" ]]; then
       local work_dir
       work_dir="$(mktemp -d)"
-      setup_secrets "$SECRETS_FILE" "$CLONE_DIR" "$work_dir"
 
-      # Start proxy
-      local proxy_args=("start" "--port" "0" "--vault" "$work_dir/vault.json")
+      # Backup originals before masking (so we can restore on proxy failure)
+      for sf in "${SECRETS_FILES[@]}"; do
+        [[ -f "$CLONE_DIR/$sf" ]] && cp "$CLONE_DIR/$sf" "$work_dir/backup_$(basename "$sf")"
+      done
+
+      local vault_file
+      vault_file=$(setup_secrets "$CLONE_DIR" "$work_dir" "${SECRETS_FILES[@]}")
+
+      # Start proxy (it prints PORT=<N> and PID=<N> then closes stdout)
+      info "starting secret masking proxy..."
+      local proxy_args=("start" "--port" "0" "--vault" "$vault_file")
       if $SECRET_LOG; then
         proxy_args+=("--log" "$sess_dir/proxy.log")
       fi
-      PROXY_PORT=$("$proxy_bin" "${proxy_args[@]}" 2>/dev/null | grep -oE 'PORT=[0-9]+' | cut -d= -f2)
-      proxy_pid=$!
+      if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 ]]; then
+        local joined
+        joined=$(IFS=,; echo "${ALLOWED_DOMAINS[*]}")
+        proxy_args+=("--allowed-domains" "$joined")
+      fi
+      if [[ ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
+        local joined
+        joined=$(IFS=,; echo "${BLOCKED_DOMAINS[*]}")
+        proxy_args+=("--blocked-domains" "$joined")
+      fi
+      local proxy_output
+      proxy_output=$("$proxy_bin" "${proxy_args[@]}" 2>/dev/null)
+      PROXY_PORT=$(echo "$proxy_output" | grep -oE 'PORT=[0-9]+' | cut -d= -f2)
+      proxy_pid=$(echo "$proxy_output" | grep -oE 'PID=[0-9]+' | cut -d= -f2)
 
-      # Inject proxy env into clone
-      cat >> "$CLONE_DIR/.zshenv" <<PROXYEOF
-export HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT}
-export HTTP_PROXY=http://127.0.0.1:${PROXY_PORT}
-export NODE_EXTRA_CA_CERTS=/tmp/parcai-proxy-ca.crt
-PROXYEOF
+      if [[ -z "$PROXY_PORT" ]]; then
+        warn "failed to start proxy — restoring original secrets files"
+        # Restore originals so the agent doesn't see broken fake tokens
+        for sf in "${SECRETS_FILES[@]}"; do
+          local backup="$work_dir/backup_$(basename "$sf")"
+          [[ -f "$backup" ]] && cp "$backup" "$CLONE_DIR/$sf"
+        done
+        SECRETS_ACTIVE=false
+      else
+        SECRETS_ACTIVE=true
+        info "proxy listening on 127.0.0.1:$PROXY_PORT (PID $proxy_pid)"
+      fi
     else
-      warn "parcai-proxy binary not found — --secrets requires proxy/parcai-proxy"
+      warn "parcai-proxy not found — --secrets requires proxy/parcai-proxy"
       warn "continuing without secret masking"
-      SECRETS_FILE=""
+      SECRETS_ACTIVE=false
     fi
   fi
 
@@ -514,16 +603,30 @@ PROXYEOF
     local claude_bin
     claude_bin="$(command -v claude 2>/dev/null)" || die "claude not found in PATH"
     claude_bin_dir="$(dirname "$claude_bin")"
+
+    # Create ~/.local/bin/claude symlink in clone so Claude finds itself at $HOME/.local/bin
+    # (Claude checks installMethod=native and expects ~/.local/bin in PATH)
+    mkdir -p "$CLONE_DIR/.local/bin"
+    ln -sf "$claude_bin" "$CLONE_DIR/.local/bin/claude"
   fi
 
   # Create minimal shell config in the clone
   cat > "$CLONE_DIR/.zshenv" 2>/dev/null <<SHELLEOF || true
 # parcai: minimal env
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin${claude_bin_dir:+:$claude_bin_dir}"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin${claude_bin_dir:+:$claude_bin_dir}:\$HOME/.local/bin"
 SHELLEOF
 
   # Inject env overrides and domain config
   inject_env_into_shell_config "$CLONE_DIR/.zshenv"
+
+  # Inject proxy env vars if secrets are active
+  if $SECRETS_ACTIVE && [[ -n "${PROXY_PORT:-}" ]]; then
+    cat >> "$CLONE_DIR/.zshenv" <<PROXYEOF
+export HTTPS_PROXY=http://127.0.0.1:${PROXY_PORT}
+export HTTP_PROXY=http://127.0.0.1:${PROXY_PORT}
+export NODE_EXTRA_CA_CERTS=/tmp/parcai-proxy-ca.crt
+PROXYEOF
+  fi
 
   if $SHELL_ONLY; then
     cat > "$CLONE_DIR/.zshrc" 2>/dev/null <<'SHELLEOF' || true
@@ -540,16 +643,12 @@ SHELLEOF
   fi
 
   # Generate sandbox profile
+  info "generating sandbox profile..."
   SANDBOX_PROFILE="$(mktemp /tmp/parcai-XXXXXXXX).sb"
   generate_profile "$CLONE_DIR" "$HOME" > "$SANDBOX_PROFILE"
-
-  if $VERBOSE; then
-    info "clone:   $CLONE_DIR"
-    info "session: $sess_dir"
-    info "profile: $SANDBOX_PROFILE"
-    info "network: $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
-    [[ -n "$SECRETS_FILE" ]] && info "secrets: active (proxy port ${PROXY_PORT:-n/a})"
-  fi
+  info "sandbox profile: $SANDBOX_PROFILE"
+  info "network: $( $NO_NETWORK && echo 'denied' || echo 'allowed' )"
+  $SECRETS_ACTIVE && info "secrets: active (proxy port ${PROXY_PORT:-n/a})"
 
   if $DRY_RUN; then
     echo ""
@@ -571,14 +670,14 @@ SHELLEOF
     echo -e "${GREEN}${BOLD}[parcai]${RESET} only ${BOLD}$project_name/${RESET} is accessible."
   fi
   $NO_NETWORK && echo -e "${YELLOW}[parcai]${RESET} network access is ${BOLD}disabled${RESET}"
-  [[ -n "$SECRETS_FILE" ]] && echo -e "${YELLOW}[parcai]${RESET} secrets masked via proxy"
+  $SECRETS_ACTIVE && echo -e "${YELLOW}[parcai]${RESET} secrets masked via proxy (${#SECRETS_FILES[@]} file(s))"
   echo ""
 
   set +e
   pushd "$CLONE_DIR" > /dev/null 2>&1
   PARCAI=1 \
   PARCAI_BACKEND=sandbox-exec \
-  PARCAI_HOST_CWD="$cwd" \
+  PARCAI_HOST_CWD="$(basename "$cwd")" \
   HOME="$CLONE_DIR" \
   ZDOTDIR="$CLONE_DIR" \
   sandbox-exec -f "$SANDBOX_PROFILE" /bin/zsh -i
@@ -588,13 +687,15 @@ SHELLEOF
 
   echo ""
 
-  # Persist Claude config (always, silently)
+  # Persist Claude config
+  info "persisting Claude config to $CLAUDE_HOME"
   persist_claude_config "$CLONE_DIR"
 
   # Handle project changes
   handle_changes "$CLONE_DIR" "$cwd"
 
   # Cleanup
+  info "cleaning up sandbox..."
   cleanup_macos "$proxy_pid"
 
   return $EXIT_CODE
@@ -626,7 +727,11 @@ diff_changes() {
     --exclude='.local/' --exclude='Library/' --exclude='.claude.json'
     --exclude='Applications/'
   )
-  [[ -n "$SECRETS_FILE" ]] && exclude_args+=(--exclude='.env')
+  if $SECRETS_ACTIVE; then
+    for sf in "${SECRETS_FILES[@]}"; do
+      exclude_args+=(--exclude="$sf")
+    done
+  fi
 
   local changes
   changes=$(rsync -rlpn --delete --out-format="%i %n" \
@@ -662,7 +767,11 @@ apply_changes() {
     --exclude='.local/' --exclude='Library/' --exclude='.claude.json'
     --exclude='Applications/'
   )
-  [[ -n "$SECRETS_FILE" ]] && exclude_args+=(--exclude='.env')
+  if $SECRETS_ACTIVE; then
+    for sf in "${SECRETS_FILES[@]}"; do
+      exclude_args+=(--exclude="$sf")
+    done
+  fi
 
   rsync -rl --delete "${exclude_args[@]}" "$clone/" "$original/"
 }
@@ -724,7 +833,7 @@ while [[ $# -gt 0 ]]; do
       NO_NETWORK=true; shift ;;
     --secrets)
       [[ $# -ge 2 ]] || die "--secrets requires a file argument"
-      SECRETS_FILE="$2"; shift 2 ;;
+      SECRETS_FILES+=("$2"); shift 2 ;;
     --secret-log)
       SECRET_LOG=true; shift ;;
     --apply)
@@ -753,15 +862,30 @@ if $AUTO_APPLY && $AUTO_DISCARD; then
   die "--apply and --discard are mutually exclusive"
 fi
 
-if $SECRET_LOG && [[ -z "$SECRETS_FILE" ]]; then
-  die "--secret-log requires --secrets"
-fi
-
 # --- Main ---
+
+# Create default .parcai.json if it doesn't exist
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  info "no .parcai.json found — creating default config"
+  generate_default_config > "$CONFIG_FILE"
+fi
 
 # Load config file (before platform dispatch, after CLI parsing)
 # CLI flags have already set variables; load_config only fills unset values
 load_config "$CONFIG_FILE"
+
+# Only mask secrets files that actually exist in the project
+local_secrets=()
+for sf in "${SECRETS_FILES[@]}"; do
+  if [[ -f "$sf" ]]; then
+    local_secrets+=("$sf")
+  fi
+done
+SECRETS_FILES=("${local_secrets[@]+"${local_secrets[@]}"}")
+
+if $SECRET_LOG && [[ ${#SECRETS_FILES[@]} -eq 0 ]]; then
+  die "--secret-log requires secrets files (none found in project)"
+fi
 
 # Validate domain config
 if [[ ${#ALLOWED_DOMAINS[@]} -gt 0 && ${#BLOCKED_DOMAINS[@]} -gt 0 ]]; then
