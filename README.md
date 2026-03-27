@@ -4,7 +4,7 @@ Lightweight shell isolation for AI agents. Run Claude, Codex, or any AI coding a
 
 ## Why?
 
-AI coding agents can read your `~/.ssh/id_rsa`, delete files outside your project, or exfiltrate credentials via API calls. parcai prevents all of that using native OS sandboxing — no Docker, no VM, no daemon.
+AI coding agents can read your `~/.ssh/id_rsa`, delete files outside your project, or exfiltrate credentials via API calls. parcai prevents all of that using macOS native sandboxing (`sandbox-exec` + APFS clone) — no Docker, no VM, no daemon.
 
 ## Quick start
 
@@ -21,12 +21,12 @@ parcai              # launches claude in a sandbox — can only touch my-project
 
 ## How it works
 
-| | macOS | Linux |
-|---|---|---|
-| **Filesystem isolation** | `sandbox-exec` + APFS clone | `unshare` + overlayfs + `pivot_root` |
-| **Process isolation** | `deny process-info*` | PID namespace |
-| **Write protection** | Agent writes to clone, not original | Agent writes to tmpfs overlay, not original |
-| **On exit** | Diff clone vs original, prompt to apply | Diff overlay vs original, prompt to apply |
+| Feature | Mechanism |
+|---|---|
+| **Filesystem isolation** | `sandbox-exec` + APFS clone |
+| **Process isolation** | `deny process-info*` |
+| **Write protection** | Agent writes to clone, not original |
+| **On exit** | Diff clone vs original, prompt to apply |
 
 The original project is **never modified** unless you explicitly approve.
 
@@ -48,9 +48,7 @@ brew install vbarrai/tap/parcai
 
 ### Requirements
 
-- **macOS**: macOS 10.13+ with APFS (default since 2017). Uses `sandbox-exec`.
-- **Linux**: Kernel 5.11+ recommended (for unprivileged overlayfs). Uses `unshare`, `util-linux`.
-- **No root required** — runs with `--map-root-user` on Linux.
+- **macOS 10.13+** with APFS (default since 2017). Uses `sandbox-exec`.
 
 ## Usage
 
@@ -202,7 +200,7 @@ parcai preserves Claude's configuration (credentials, settings, CLAUDE.md) acros
 | Variable | Value |
 |---|---|
 | `PARCAI` | `1` |
-| `PARCAI_BACKEND` | `sandbox-exec` or `unshare` |
+| `PARCAI_BACKEND` | `sandbox-exec` |
 | `HOME` | Project directory |
 | `PATH` | `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin` |
 
@@ -213,7 +211,7 @@ parcai preserves Claude's configuration (credentials, settings, CLAUDE.md) acros
 cat ~/.ssh/id_rsa           # file not found / denied
 ls ~/                       # only project visible
 rm -rf /                    # no effect on host
-ps aux                      # only sandbox processes (Linux) / denied (macOS)
+ps aux                      # denied by sandbox
 kill -9 1                   # denied
 echo "pwned" > /etc/hosts   # read-only / denied
 

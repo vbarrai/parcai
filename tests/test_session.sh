@@ -84,8 +84,7 @@ echo 'ls ~/.claude/ 2>&1 && exit' | \
   "$PARCAI_BIN" --discard 2>/dev/null > "$TEST_DIR/output2.txt"
 
 # In the sandbox, ~/.claude should not resolve to the global one
-# On Linux (unshare), HOME=/project, so ~/.claude is .claude/ (the injected one)
-# On macOS, ~/.claude is denied in the sandbox profile
+# ~/.claude is denied in the sandbox profile
 if grep -q "projects" "$TEST_DIR/output2.txt" 2>/dev/null; then
   fail "global ~/.claude appears accessible (projects/ dir found)"
 else

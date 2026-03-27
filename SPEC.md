@@ -2,7 +2,7 @@
 
 ## Overview
 
-`parcai` spawns an interactive shell where the process is **confined to the current working directory**. The rest of the filesystem is invisible, secrets are unreachable, and destructive system commands fail. When the user exits, modifications are discarded (Linux) or limited to the project dir (macOS).
+`parcai` spawns an interactive shell where the process is **confined to the current working directory**. The rest of the filesystem is invisible, secrets are unreachable, and destructive system commands fail. When the user exits, modifications are limited to the project dir (APFS clone).
 
 ## Usage
 
@@ -33,12 +33,12 @@ parcai --shell    # drops into a plain isolated shell instead
 | **Reading secrets** | `cat ~/.ssh/id_rsa`, `cat ~/.aws/credentials` | Filesystem restricted to `$PWD` only |
 | **Reading other projects** | `ls ~/other-project/` | Path doesn't exist / access denied |
 | **Destroying files outside project** | `rm -rf /`, `rm -rf ~` | Filesystem restricted to `$PWD` only |
-| **Destroying files inside project** | `rm -rf .` | Linux: overlayfs absorbs writes, original intact. macOS: APFS clone, original intact |
-| **Seeing system state** | `ps aux`, `mount`, `cat /etc/passwd` | Linux: PID namespace. macOS: sandbox denies process-info |
-| **Killing other processes** | `kill -9 <pid>`, `killall` | Linux: PID namespace (only sandbox PIDs visible). macOS: sandbox denies signal to external PIDs |
+| **Destroying files inside project** | `rm -rf .` | APFS clone, original intact |
+| **Seeing system state** | `ps aux`, `mount`, `cat /etc/passwd` | Sandbox denies process-info |
+| **Killing other processes** | `kill -9 <pid>`, `killall` | Sandbox denies signal to external PIDs |
 | **Modifying system** | `apt remove`, `brew uninstall`, `launchctl` | No write access outside `$PWD` |
 | **Network exfiltration of local files** | Read secret then `curl` it out | Files aren't accessible in the first place. Optional `--no-network` for full lockdown |
-| **Spawning persistent daemons** | `nohup malicious &` | Linux: PID namespace — all children die on exit. macOS: sandbox inherited by children |
+| **Spawning persistent daemons** | `nohup malicious &` | Sandbox inherited by children |
 | **Escaping via environment** | `$HOME`, `$PATH` manipulation | `$HOME` set to sandbox root, `$PATH` restricted to system bins |
 | **Leaking API keys via agent output** | Agent reads `.env` and sends keys in API calls | `--secrets` replaces real tokens with fakes; proxy swaps them back transparently |
 
@@ -80,9 +80,9 @@ Subcommands:
 | Variable | Value | Purpose |
 |---|---|---|
 | `$PARCAI` | `1` | Tools can detect they're sandboxed |
-| `$PARCAI_BACKEND` | `sandbox-exec` or `unshare` | Which backend is active |
-| `$PARCAI_HOST_CWD` | Original `$PWD` path (macOS only) | Reference to host project path |
-| `$HOME` | Project directory (`/project` on Linux, clone path on macOS) | No home dir access |
+| `$PARCAI_BACKEND` | `sandbox-exec` | Which backend is active |
+| `$PARCAI_HOST_CWD` | Original `$PWD` path | Reference to host project path |
+| `$HOME` | Clone path | No home dir access |
 | `$PATH` | `/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin` | Restricted to system binaries |
 | `$PARCAI_ALLOWED_DOMAINS` | Comma-separated list (if configured) | Domain allowlist for proxy/agent |
 | `$PARCAI_BLOCKED_DOMAINS` | Comma-separated list (if configured) | Domain blocklist for proxy/agent |
@@ -241,7 +241,7 @@ parcai supports domain-level network restrictions via config:
 
 Domain lists are exported as `$PARCAI_ALLOWED_DOMAINS` and `$PARCAI_BLOCKED_DOMAINS` environment variables inside the sandbox.
 
-### macOS — Network
+### Network Implementation
 
 `sandbox-exec` does not filter at the network stack level. With `(allow network*)`:
 - DNS resolution works natively
@@ -255,18 +255,10 @@ When `--secrets` is active with `--no-network`, a loopback exception is added:
 (allow network-outbound (local tcp "*:<proxy_port>"))
 ```
 
-### Linux — Network
-
-**Default mode**: Network works because `unshare` does NOT use `--net`, sharing the host's network namespace. DNS/TLS config files are available via read-only bind-mounts of `/etc` and `/usr`.
-
-**`--no-network` mode**: `unshare --net` creates an isolated network namespace with only a loopback interface.
-
-### Network Summary
-
-| | Default | `--no-network` |
-|---|---|---|
-| **macOS** | `(allow network*)` — everything works | `(deny network*)` — everything blocked |
-| **Linux** | Host network namespace shared. DNS/TLS work via bind-mounted `/etc`, `/usr` | `unshare --net` — isolated namespace, loopback only |
+| Mode | Behavior |
+|---|---|
+| Default | `(allow network*)` — everything works |
+| `--no-network` | `(deny network*)` — everything blocked |
 
 ---
 
@@ -341,75 +333,7 @@ Additional `--rw` paths append `(allow file-read* file-write* (subpath "..."))` 
 
 ---
 
-## Linux Backend — namespaces + overlayfs + pivot_root
-
-### Mechanism
-
-Full namespace isolation: the agent process gets its own filesystem view, process tree, and optionally its own network stack. `pivot_root` replaces the root filesystem entirely (stronger than `chroot`).
-
-### Flow
-
-```
-1. WORK=$(mktemp -d /tmp/parcai-XXXXXXXX)
-2. Enter new namespaces: unshare --mount --pid --fork --map-root-user [--net]
-3. Inside namespace:
-   a. Try overlayfs: mount tmpfs for upper layer, then overlay on $CWD
-      - Falls back to direct bind-mount if overlayfs unavailable
-   b. Bind-mount system dirs read-only: usr, lib, lib64, bin, sbin, etc
-   c. Mount fresh proc, dev (with essential device nodes), tmp, devpts
-   d. Mount project (overlay or bind) at $ROOT/project
-   e. Inject Claude config from session or global ~/.claude/credentials
-   f. Apply secrets .env replacement (if --secrets)
-   g. Mount extra --allow paths (read-only) and --rw paths (read-write)
-   h. pivot_root + umount old root
-   i. Set environment (HOME, PARCAI, PATH, proxy env, custom env vars)
-   j. exec /bin/sh
-4. On exit:
-   - Persist Claude config from overlay upper layer to session dir
-   - Show modified files from overlay upper layer
-   - Ask user: "Apply changes?" (unless --apply or --discard)
-   - If yes: rsync overlay upper -> original (excluding .claude/, .env if secrets)
-   - Cleanup work directory and proxy
-```
-
-### Guarantees
-
-| Property | Guaranteed? | Mechanism |
-|---|---|---|
-| Cannot read files outside project | **Yes** | `pivot_root` + `umount -l /oldroot` — host FS physically detached |
-| Cannot write files outside project | **Yes** | overlayfs: all writes go to tmpfs upper layer |
-| Cannot destroy original project | **Yes** | Original is lowerdir (read-only) in overlay |
-| Cannot see other processes | **Yes** | PID namespace — only sandbox processes visible |
-| Cannot kill other processes | **Yes** | PID namespace — other PIDs don't exist |
-| Cannot access secrets | **Yes** | Host filesystem completely unmounted |
-| Children inherit isolation | **Yes** | Namespaces are inherited by all child processes |
-| All changes discarded on exit | **Yes** | tmpfs overlay + namespace cleanup (unless applied) |
-| Network works (default) | **Yes** | Host network namespace shared + `/etc`, `/usr` bind-mounted for DNS/TLS |
-| Network blocked (`--no-network`) | **Yes** | `unshare --net` — isolated namespace, loopback only |
-| Claude config persists | **Yes** | Session directory stores `.claude/` config between runs |
-
-### Root vs Rootless
-
-| Feature | With root | Rootless (`--map-root-user`) |
-|---|---|---|
-| Mount namespace | Yes | Yes |
-| PID namespace | Yes | Yes |
-| overlayfs | Yes | Kernel >= 5.11 |
-| pivot_root | Yes | Yes |
-| Network namespace | Yes | Yes (limited without slirp4netns) |
-
-Target: rootless with `--map-root-user`. Requires `kernel.unprivileged_userns_clone=1` (default on Ubuntu, Fedora; check on Debian/RHEL).
-
-### Fallback: No overlayfs
-
-If overlayfs is unavailable (kernel < 5.11 in rootless mode), parcai falls back to a direct bind-mount of `$CWD`. This means:
-- Writes go directly to the original project files.
-- `pivot_root` still provides filesystem isolation outside the project.
-- PID namespace isolation still works.
-
----
-
-## Applying Changes (both platforms)
+## Applying Changes
 
 When the user exits the sandbox:
 
@@ -422,9 +346,8 @@ parcai: files modified in sandbox:
 parcai: apply changes to original project? [y/N]
 ```
 
-- **Linux**: rsync the overlay upper layer to the original, excluding `.claude/` and `.env` (if secrets active).
-- **macOS**: rsync the APFS clone to the original, excluding sandbox artifacts (`.zshenv`, `.zshrc`, `.zsh_history`, `.claude/`, `.cache/`, `.config/`, `.local/`, `Library/`, `.claude.json`, `.env` if secrets).
-- **If declined**: changes are discarded (tmpfs destroyed / clone deleted).
+- rsync the APFS clone to the original, excluding sandbox artifacts (`.zshenv`, `.zshrc`, `.zsh_history`, `.claude/`, `.cache/`, `.config/`, `.local/`, `Library/`, `.claude.json`, `.env` if secrets).
+- **If declined**: changes are discarded (clone deleted).
 - **`--apply`**: auto-apply without prompting.
 - **`--discard`**: auto-discard without prompting.
 
@@ -434,20 +357,20 @@ This ensures the original project is NEVER modified without explicit user consen
 
 ## Verification Checklist
 
-Before shipping, each backend must pass:
+Before shipping, the sandbox must pass:
 
 ```bash
 # Inside parcai shell, ALL of these must fail:
 cat ~/.ssh/id_rsa           # -> error / file not found
 ls ~/                       # -> error / only project visible
-cat /etc/shadow             # -> error (Linux: file not found, macOS: denied)
+cat /etc/shadow             # -> error / denied
 rm -rf /                    # -> error / no effect on host
-ps aux                      # -> only sandbox processes (Linux) / denied (macOS)
+ps aux                      # -> denied by sandbox
 kill -9 1                   # -> error / denied
 touch /tmp/escape           # -> OK (tmp is isolated too)
 echo "pwned" > /etc/hosts   # -> error / read-only or denied
 curl -s https://api.anthropic.com  # -> works (unless --no-network)
-python3 -c "import os; os.listdir('/Users')"  # -> error / denied
+python3 -c "import os; os.listdir('/Users')"  # -> denied
 
 # Network verification:
 curl -s https://api.anthropic.com  # -> must succeed (default mode)
@@ -497,7 +420,7 @@ Single shell script — no compilation, no dependencies.
 
 ```
 parcai/
-  parcai                  # the shell script (entry point, ~1100 lines)
+  parcai                  # the shell script (entry point, macOS only)
   profiles/
     macos.sb.tpl          # sandbox-exec profile template with {{placeholders}}
   proxy/

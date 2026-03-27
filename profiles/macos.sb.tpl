@@ -6,7 +6,7 @@
 (deny default)
 
 ;; ============================================================
-;; PROCESS EXECUTION (restricted to system binaries only)
+;; PROCESS EXECUTION (restricted to system binaries + claude)
 ;; ============================================================
 (allow process-exec
   (subpath "/usr/bin")
@@ -14,7 +14,8 @@
   (subpath "/usr/sbin")
   (subpath "/sbin")
   (subpath "/opt/homebrew/bin")
-  (subpath "/usr/local/bin"))
+  (subpath "/usr/local/bin")
+{{CLAUDE_EXEC_RULE}})
 
 (allow process-fork)
 (allow signal (target self))
@@ -28,22 +29,24 @@
   (subpath "{{CLONE}}"))
 
 ;; ============================================================
-;; FILESYSTEM — READ-ONLY ACCESS (minimal system paths)
+;; FILESYSTEM — READ-ONLY ACCESS
 ;; ============================================================
+
+;; Root directory (needed for path resolution)
+(allow file-read* (literal "/"))
+
+;; System paths
 (allow file-read*
-  (subpath "/usr/lib")
-  (subpath "/usr/bin")
+  (subpath "/usr")
   (subpath "/bin")
-  (subpath "/usr/sbin")
   (subpath "/sbin")
-  (subpath "/Library/Frameworks")
+  (subpath "/Library")
   (subpath "/System")
-  (subpath "/opt/homebrew")
-  (subpath "/usr/local")
+  (subpath "/opt")
   (subpath "/etc")
   (subpath "/private/etc")
-  (subpath "/var/select")
-  (subpath "/private/var/select")
+  (subpath "/private/var")
+  (subpath "/var")
   (subpath "/private/tmp")
   (subpath "/tmp")
   (literal "/dev/null")
@@ -55,21 +58,13 @@
   (literal "/dev/fd")
   (subpath "/dev/fd"))
 
-;; Shell config (read-only, so prompt works)
+;; User home — broad read (claude needs symlink resolution, Library, etc.)
 (allow file-read*
-  (literal "{{HOME}}/.zshrc")
-  (literal "{{HOME}}/.zshenv")
-  (literal "{{HOME}}/.zprofile")
-  (literal "{{HOME}}/.bashrc")
-  (literal "{{HOME}}/.bash_profile")
-  (literal "{{HOME}}/.profile"))
-
-;; NOTE: {{HOME}}/.claude is NOT whitelisted here.
-;; Claude config is injected into the clone at {{CLONE}}/.claude/
-;; and persisted to ~/.parcai/sessions/<hash>/claude-config/ on exit.
+  (literal "/Users")
+  (subpath "{{HOME}}"))
 
 ;; ============================================================
-;; DENY sensitive paths explicitly (belt + suspenders)
+;; DENY sensitive paths explicitly (overrides the broad home read)
 ;; ============================================================
 (deny file-read* file-write*
   (subpath "{{HOME}}/.ssh")
@@ -85,6 +80,15 @@
   (literal "{{HOME}}/.env")
   (literal "{{HOME}}/.netrc")
   (literal "{{HOME}}/.npmrc"))
+
+;; Temp + device write access
+(allow file-write* (subpath "/private/tmp") (subpath "/tmp"))
+(allow file-write* (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/ttys[0-9]+$"))
+
+;; TTY access (needed for setRawMode / interactive terminal)
+(allow file-ioctl
+  (literal "/dev/tty")
+  (regex #"^/dev/ttys[0-9]+$"))
 
 ;; ============================================================
 ;; PROCESS VISIBILITY — deny inspecting other processes

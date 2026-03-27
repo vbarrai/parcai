@@ -71,7 +71,7 @@ fi
 
 # rm -rf / should fail or have no effect on host
 if rm -rf / 2>/dev/null; then
-  # If we're still running, it was harmless (overlayfs or denied)
+  # If we're still running, it was harmless (denied)
   pass "rm -rf / had no effect (still running)"
 else
   pass "rm -rf / denied"
@@ -108,34 +108,17 @@ fi
 echo ""
 echo "--- Process isolation ---"
 
-if [[ "$PARCAI_BACKEND" == "unshare" ]]; then
-  # Linux: PID namespace — ps should only show sandbox processes
-  PS_COUNT=$(ps aux 2>/dev/null | wc -l)
-  if [[ "$PS_COUNT" -lt 20 ]]; then
-    pass "ps aux shows limited processes ($PS_COUNT lines) — PID namespace active"
-  else
-    fail "ps aux shows $PS_COUNT processes — PID namespace may not be active"
-  fi
+# macOS: process-info denied
+if ps aux 2>/dev/null | wc -l | grep -q "^[0-9]"; then
+  skip "ps aux ran (macOS sandbox may allow limited process info)"
+else
+  pass "ps aux blocked by sandbox"
+fi
 
-  # Cannot kill PID 1 on host (in PID namespace, PID 1 is our init)
-  if kill -0 1 2>/dev/null; then
-    pass "PID 1 is our sandbox init (PID namespace)"
-  else
-    pass "cannot signal PID 1 (expected)"
-  fi
-elif [[ "$PARCAI_BACKEND" == "sandbox-exec" ]]; then
-  # macOS: process-info denied
-  if ps aux 2>/dev/null | wc -l | grep -q "^[0-9]"; then
-    skip "ps aux ran (macOS sandbox may allow limited process info)"
-  else
-    pass "ps aux blocked by sandbox"
-  fi
-
-  if kill -9 1 2>/dev/null; then
-    fail "kill -9 1 succeeded"
-  else
-    pass "kill -9 1 blocked"
-  fi
+if kill -9 1 2>/dev/null; then
+  fail "kill -9 1 succeeded"
+else
+  pass "kill -9 1 blocked"
 fi
 
 # --- Environment ---
