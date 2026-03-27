@@ -14,6 +14,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
+const { Transform } = require("stream");
 
 // ─── CLI Parsing ────────────────────────────────────────────────
 
@@ -394,7 +395,23 @@ function handleHttpRequest(clientReq, clientRes, vault, logger, args) {
     }
 
     const proxyReq = http.request(options, (proxyRes) => {
-      collectBody(proxyRes, (resBody) => {
+      // SSE streaming path: pipe through replacement transform
+      if (isSSEResponse(proxyRes.headers)) {
+        streamSSEResponse(proxyRes, clientRes, vault, logger, targetUrl.hostname, targetUrl.pathname);
+        return;
+      }
+
+      collectBody(proxyRes, (resBody, partial) => {
+        if (resBody === null) {
+          // Response exceeded size limit; stream directly without token replacement
+          const headers = { ...proxyRes.headers };
+          replaceHeaderTokens(headers, vault, "inbound");
+          clientRes.writeHead(proxyRes.statusCode, headers);
+          if (partial && partial.length > 0) clientRes.write(partial);
+          proxyRes.pipe(clientRes);
+          return;
+        }
+
         const replacedResBody = replaceRealWithFake(vault, resBody);
 
         if (logger) {
@@ -410,7 +427,7 @@ function handleHttpRequest(clientReq, clientRes, vault, logger, args) {
 
         clientRes.writeHead(proxyRes.statusCode, headers);
         clientRes.end(replacedResBody);
-      });
+      }, 50 * 1024 * 1024);
     });
 
     proxyReq.on("error", (err) => {
@@ -512,7 +529,23 @@ function handleMitmRequest(mitmReq, mitmRes, hostname, targetPort, vault, logger
     }
 
     const proxyReq = https.request(options, (proxyRes) => {
-      collectBody(proxyRes, (resBody) => {
+      // SSE streaming path: pipe through replacement transform
+      if (isSSEResponse(proxyRes.headers)) {
+        streamSSEResponse(proxyRes, mitmRes, vault, logger, hostname, reqPath);
+        return;
+      }
+
+      collectBody(proxyRes, (resBody, partial) => {
+        if (resBody === null) {
+          // Response exceeded size limit; stream directly without token replacement
+          const headers = { ...proxyRes.headers };
+          replaceHeaderTokens(headers, vault, "inbound");
+          mitmRes.writeHead(proxyRes.statusCode, headers);
+          if (partial && partial.length > 0) mitmRes.write(partial);
+          proxyRes.pipe(mitmRes);
+          return;
+        }
+
         const replacedResBody = replaceRealWithFake(vault, resBody);
 
         if (logger) {
@@ -528,7 +561,7 @@ function handleMitmRequest(mitmReq, mitmRes, hostname, targetPort, vault, logger
 
         mitmRes.writeHead(proxyRes.statusCode, headers);
         mitmRes.end(replacedResBody);
-      });
+      }, 50 * 1024 * 1024);
     });
 
     proxyReq.on("error", (err) => {
@@ -540,13 +573,90 @@ function handleMitmRequest(mitmReq, mitmRes, hostname, targetPort, vault, logger
   });
 }
 
+// ─── SSE Streaming Support ───────────────────────────────────────
+
+function isSSEResponse(headers) {
+  const contentType = (headers["content-type"] || "").toLowerCase();
+  return contentType.includes("text/event-stream");
+}
+
+function createReplacementStream(vault, direction) {
+  const replaceFn =
+    direction === "outbound" ? replaceFakeWithReal : replaceRealWithFake;
+
+  let buffer = "";
+
+  return new Transform({
+    decodeStrings: false,
+    encoding: "utf8",
+
+    transform(chunk, encoding, callback) {
+      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+
+      // Split on newlines, keeping the delimiter
+      const lines = buffer.split("\n");
+      // Keep the last element as the buffer (may be incomplete line)
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        this.push(replaceFn(vault, line) + "\n");
+      }
+
+      callback();
+    },
+
+    flush(callback) {
+      // Flush any remaining buffered data
+      if (buffer.length > 0) {
+        this.push(replaceFn(vault, buffer));
+        buffer = "";
+      }
+      callback();
+    },
+  });
+}
+
+function streamSSEResponse(proxyRes, clientRes, vault, logger, host, urlPath) {
+  const headers = { ...proxyRes.headers };
+  replaceHeaderTokens(headers, vault, "inbound");
+  // Remove content-length since we are streaming with replacement
+  delete headers["content-length"];
+
+  clientRes.writeHead(proxyRes.statusCode, headers);
+
+  const replacementStream = createReplacementStream(vault, "inbound");
+  proxyRes.pipe(replacementStream).pipe(clientRes);
+
+  proxyRes.on("error", () => {
+    clientRes.end();
+  });
+  replacementStream.on("error", () => {
+    clientRes.end();
+  });
+}
+
 // ─── Helpers ────────────────────────────────────────────────────
 
-function collectBody(stream, callback) {
+function collectBody(stream, callback, maxSize) {
   const chunks = [];
-  stream.on("data", (chunk) => chunks.push(chunk));
-  stream.on("end", () => callback(Buffer.concat(chunks).toString("utf8")));
-  stream.on("error", () => callback(""));
+  let totalSize = 0;
+  let exceeded = false;
+  stream.on("data", (chunk) => {
+    if (exceeded) return;
+    totalSize += chunk.length;
+    if (maxSize && totalSize > maxSize) {
+      exceeded = true;
+      callback(null, Buffer.concat(chunks));
+      return;
+    }
+    chunks.push(chunk);
+  });
+  stream.on("end", () => {
+    if (!exceeded) callback(Buffer.concat(chunks).toString("utf8"));
+  });
+  stream.on("error", () => {
+    if (!exceeded) callback("");
+  });
 }
 
 function replaceHeaderTokens(headers, vault, direction) {
@@ -598,6 +708,16 @@ function main() {
     }, 5000);
     return;
   }
+
+  // Clean up stale temp files from previous crashed runs
+  try {
+    const tmpFiles = fs.readdirSync("/tmp");
+    for (const f of tmpFiles) {
+      if (f.startsWith("parcai-leaf-") || f.startsWith("parcai-ca-")) {
+        try { fs.unlinkSync(path.join("/tmp", f)); } catch {}
+      }
+    }
+  } catch {}
 
   // Load vault
   const vault = loadVault(args.vault);

@@ -16,6 +16,7 @@ SECRETS_ACTIVE=false
 SECRET_LOG=true
 EXTRA_ALLOW=()
 EXTRA_RW=()
+EXTRA_DENY=()
 ALLOWED_DOMAINS=()
 BLOCKED_DOMAINS=()
 ON_EXIT=""
@@ -42,6 +43,7 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Options:${RESET}
   --allow <path>     Additional path to whitelist (read-only). Repeatable.
   --rw <path>        Additional path to whitelist (read-write). Repeatable.
+  --deny <path>      Deny all file access to <path>. Repeatable.
   --no-network       Deny all network access inside the sandbox.
   --secrets <file>   Mask secrets from <file> (repeatable). Default: .env if it exists.
   --secret-log       Write proxy audit log to session directory.
@@ -182,6 +184,12 @@ load_config() {
     EXTRA_RW+=("$p")
   done < <(json_array "$json" "rw")
 
+  # deny (array of paths)
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    EXTRA_DENY+=("$p")
+  done < <(json_array "$json" "deny")
+
   # allowed_domains (array of domain strings)
   while IFS= read -r d; do
     [[ -z "$d" ]] && continue
@@ -244,6 +252,7 @@ generate_default_config() {
 
   "allow": [],
   "rw": [],
+  "deny": [],
 
   "allowed_domains": [],
   "blocked_domains": [],
@@ -295,7 +304,7 @@ session_dir() {
   local hash
   hash=$(printf '%s' "$cwd" | sha256sum 2>/dev/null || printf '%s' "$cwd" | shasum -a 256 2>/dev/null)
   hash="${hash%% *}"
-  hash="${hash:0:12}"
+  hash="${hash:0:20}"
   echo "$HOME/.parcai/sessions/$hash"
 }
 
@@ -509,6 +518,13 @@ generate_profile() {
     local resolved
     resolved="$(cd "$path" 2>/dev/null && pwd)" || die "path not found: $path"
     profile+=$'\n'"(allow file-read* file-write* (subpath \"$resolved\"))"
+  done
+
+  # Deny paths
+  for path in "${EXTRA_DENY[@]+"${EXTRA_DENY[@]}"}"; do
+    local resolved
+    resolved="$(cd "$path" 2>/dev/null && pwd)" || die "deny path not found: $path"
+    profile+=$'\n'"(deny file-read* file-write* (subpath \"$resolved\"))"
   done
 
   echo "$profile"
@@ -829,6 +845,9 @@ while [[ $# -gt 0 ]]; do
     --rw)
       [[ $# -ge 2 ]] || die "--rw requires a path argument"
       EXTRA_RW+=("$2"); shift 2 ;;
+    --deny)
+      [[ $# -ge 2 ]] || die "--deny requires a path argument"
+      EXTRA_DENY+=("$2"); shift 2 ;;
     --no-network)
       NO_NETWORK=true; shift ;;
     --secrets)

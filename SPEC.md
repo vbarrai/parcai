@@ -398,6 +398,22 @@ Additional `--rw` paths append `(allow file-read* file-write* (subpath "..."))` 
 
 **Note:** The broad home read (`subpath {{HOME}}`) is required because Claude needs to resolve symlinks (`~/.local/bin/claude` → `~/.local/share/claude/versions/...`) and access `~/Library/`. Sensitive directories are blocked by explicit deny rules which take precedence.
 
+### What remains readable
+
+The broad home read rule (`allow file-read* (subpath "{{HOME}}")`) means that any directory under `$HOME` that is **not** in the explicit deny list above remains readable inside the sandbox. Examples:
+
+- `~/.config/` (except `~/.config/gcloud` and `~/.config/gh`, which are denied)
+- `~/Library/` (needed for macOS system frameworks, fonts, TLS certificates, etc.)
+- `~/.local/` (needed to resolve the `claude` binary symlink chain)
+- `~/.gitconfig` (needed for git operations inside the sandbox)
+
+This is required for Claude and standard dev tools to function correctly. If you need to restrict additional paths, you can:
+
+- Use the `--deny <path>` CLI flag to add deny rules at launch.
+- Add paths to the `deny` array in your project's `.parcai.json` config file.
+
+Custom deny rules take precedence over the broad home read, just like the built-in deny list.
+
 ### Guarantees
 
 | Property | Guaranteed? | Mechanism |

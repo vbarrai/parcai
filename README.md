@@ -275,6 +275,17 @@ parcai --secrets .env.test
 ./tests/test_session.sh ./parcai
 ```
 
+## Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Abort trap: 6` | Claude binary not in the sandbox-exec whitelist | Ensure `claude` is installed and available in `PATH` so parcai can resolve and whitelist it |
+| `setRawMode failed with errno: 1` | TTY not available inside the sandbox | Fixed in a recent release. Update parcai to the latest version |
+| `installMethod is native, but claude command not found` | Claude's `~/.local/bin` was not included in the sandbox `PATH` | Fixed in a recent release. Update parcai to the latest version |
+| `can't set tty pgrp: operation not permitted` | Sandbox was blocking TTY process-group control | Fixed in a recent release. Update parcai to the latest version |
+| Proxy hangs on startup | Node.js is not installed | `--secrets` requires Node.js for the MITM proxy. Install Node.js and try again |
+| `parcai-proxy: domain "X" is not allowed` | Domain blocked by network filtering config | Check `allowed_domains` / `blocked_domains` in `.parcai.json` or CLI flags and add the domain if needed |
+
 ## License
 
 MIT
