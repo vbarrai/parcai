@@ -74,6 +74,7 @@
   (subpath "{{HOME}}/.kube")
   (subpath "{{HOME}}/.docker")
   (subpath "{{HOME}}/.claude")
+  (subpath "{{HOME}}/.parcai")
   (literal "{{HOME}}/.env")
   (literal "{{HOME}}/.netrc")
   (literal "{{HOME}}/.npmrc")
