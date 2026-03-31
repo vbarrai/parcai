@@ -573,6 +573,12 @@ run_macos() {
       local vault_file
       vault_file=$(setup_secrets "$CLONE_DIR" "$work_dir" "${SECRETS_FILES[@]}")
 
+      # Move vault out of /tmp into ~/.parcai/sessions/ (denied by sandbox profile)
+      # so the agent cannot read real secrets from vault.json
+      local secure_vault="$sess_dir/vault.json"
+      mv "$vault_file" "$secure_vault"
+      vault_file="$secure_vault"
+
       # Start proxy (it prints PORT=<N> and PID=<N> then closes stdout)
       info "starting secret masking proxy..."
       local proxy_args=("start" "--port" "0" "--vault" "$vault_file")
@@ -605,6 +611,9 @@ run_macos() {
       else
         SECRETS_ACTIVE=true
         info "proxy listening on 127.0.0.1:$PROXY_PORT (PID $proxy_pid)"
+        # Delete vault from disk — proxy already loaded it into memory.
+        # This prevents any residual access to real secrets on disk.
+        rm -f "$vault_file"
       fi
     else
       warn "parcai-proxy not found — --secrets requires proxy/parcai-proxy"
