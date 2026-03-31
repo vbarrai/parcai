@@ -9,9 +9,8 @@ AI coding agents can read your `~/.ssh/id_rsa`, delete files outside your projec
 ## Quick start
 
 ```bash
-# Install (or just clone and add to PATH)
-git clone https://github.com/vbarrai/parcai.git
-export PATH="$PWD/parcai:$PATH"
+# Install
+curl -sSL https://raw.githubusercontent.com/vbarrai/parcai/main/install.sh | bash
 
 # Use it
 cd my-project
@@ -31,6 +30,35 @@ parcai              # launches claude in a sandbox — can only touch my-project
 The original project is **never modified** unless you explicitly approve.
 
 ## Installation
+
+### One-liner
+
+```bash
+curl -sSL https://raw.githubusercontent.com/vbarrai/parcai/main/install.sh | bash
+```
+
+Installs to `~/.local/share/parcai/` and symlinks to `~/.local/bin/parcai`.
+
+You can customize the install paths:
+
+```bash
+PARCAI_INSTALL_DIR=/opt/parcai PARCAI_BIN_DIR=/usr/local/bin \
+  curl -sSL https://raw.githubusercontent.com/vbarrai/parcai/main/install.sh | bash
+```
+
+To install a specific version:
+
+```bash
+PARCAI_VERSION=v0.1.0 curl -sSL https://raw.githubusercontent.com/vbarrai/parcai/main/install.sh | bash
+```
+
+To upgrade, run the same command — it detects and replaces the existing installation:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/vbarrai/parcai/main/install.sh | bash
+# ▸ Upgrading from parcai 0.1.0
+# ▸ Upgraded: parcai 0.1.0 → parcai 0.2.0
+```
 
 ### From source
 
