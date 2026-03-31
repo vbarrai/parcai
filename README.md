@@ -68,7 +68,7 @@ git clone https://github.com/vbarrai/parcai.git
 sudo ln -s "$PWD/parcai/parcai" /usr/local/bin/parcai
 ```
 
-### Homebrew (coming soon)
+### Homebrew
 
 ```bash
 brew install vbarrai/tap/parcai
