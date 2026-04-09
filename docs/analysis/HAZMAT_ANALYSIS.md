@@ -1,110 +1,110 @@
-# Ce que parcai peut emprunter a hazmat
+# Feature Comparison: hazmat vs parcai
 
-Analyse comparative de [dredozubov/hazmat](https://github.com/dredozubov/hazmat) pour identifier les fonctionnalites, techniques et patterns transposables a parcai.
-
----
-
-## Table des matieres
-
-1. [Blocklist DNS/domaines integree](#1-blocklist-dnsdomaines-integree)
-2. [Blocklist de ports (pf firewall)](#2-blocklist-de-ports-pf-firewall)
-3. [Commande `explain` (contrat de session)](#3-commande-explain-contrat-de-session)
-4. [Support du clipboard dans le sandbox](#4-support-du-clipboard-dans-le-sandbox)
-5. [Execution depuis /tmp (langages compiles)](#5-execution-depuis-tmp-langages-compiles)
-6. [Metadata ancestors pour git](#6-metadata-ancestors-pour-git)
-7. [Generation dynamique du profil SBPL](#7-generation-dynamique-du-profil-sbpl)
-8. [Systeme d'integrations par manifests](#8-systeme-dintegrations-par-manifests)
-9. [Safe-list pour les variables d'environnement](#9-safe-list-pour-les-variables-denvironnement)
-10. [Snapshots pre-session](#10-snapshots-pre-session)
-11. [Appel direct a sandbox_init()](#11-appel-direct-a-sandbox_init)
-12. [Runner pattern (verbose/dry-run)](#12-runner-pattern-verbosedry-run)
-13. [Support multi-agent](#13-support-multi-agent)
-14. [Matrice de priorisation](#14-matrice-de-priorisation)
+Side-by-side comparison of [dredozubov/hazmat](https://github.com/dredozubov/hazmat) and [parcai](https://github.com/vbarrai/parcai), identifying features and techniques from hazmat that could improve parcai.
 
 ---
 
-## 1. Blocklist DNS/domaines integree
+## Table of Contents
 
-### Ce que fait hazmat
+1. [Built-in DNS/Domain Blocklist](#1-built-in-dnsdomain-blocklist)
+2. [Port Blocklist (pf Firewall)](#2-port-blocklist-pf-firewall)
+3. [`explain` Command (Session Contract)](#3-explain-command-session-contract)
+4. [Clipboard Support in Sandbox](#4-clipboard-support-in-sandbox)
+5. [Process Execution from /tmp (Compiled Languages)](#5-process-execution-from-tmp-compiled-languages)
+6. [Ancestor Metadata for git](#6-ancestor-metadata-for-git)
+7. [Dynamic SBPL Profile Generation](#7-dynamic-sbpl-profile-generation)
+8. [Integration Manifest System](#8-integration-manifest-system)
+9. [Environment Variable Safe-list](#9-environment-variable-safe-list)
+10. [Pre-session Snapshots](#10-pre-session-snapshots)
+11. [Direct sandbox_init() Call](#11-direct-sandbox_init-call)
+12. [Runner Pattern (verbose/dry-run)](#12-runner-pattern-verbosedry-run)
+13. [Multi-agent Support](#13-multi-agent-support)
+14. [Prioritization Matrix](#14-prioritization-matrix)
 
-hazmat bloque ~40 domaines connus d'exfiltration via `/etc/hosts` (mapping vers `0.0.0.0`). Categories :
+---
 
-| Categorie | Domaines |
-|-----------|----------|
+## 1. Built-in DNS/Domain Blocklist
+
+### hazmat
+
+hazmat blocks ~40 known exfiltration domains via `/etc/hosts` (mapped to `0.0.0.0`):
+
+| Category | Domains |
+|----------|---------|
 | **Tunnels** (21) | `ngrok.io`, `ngrok.com`, `ngrok-free.app`, `tunnel.cloudflare.com`, `trycloudflare.com`, `serveo.net`, `localtunnel.me`, `localhost.run`, `localxpose.io`, `pagekite.me`, `bore.digital`, `localtonet.com`, `zrok.io`, `devtunnels.ms`, `loca.lt`, `tunnelmole.com`, `playit.gg`, `pinggy.io`, `lokal.so`, `telebit.cloud`, `loophole.cloud` |
 | **Paste** (8) | `pastebin.com`, `paste.ee`, `ghostbin.com`, `hastebin.com`, `dpaste.org`, `justpaste.it`, `rentry.co`, `ix.io` |
 | **File sharing** (5) | `transfer.sh`, `file.io`, `gofile.io`, `catbox.moe`, `filebin.net` |
 | **Webhook capture** (5) | `webhook.site`, `requestbin.com`, `pipedream.com`, `hookbin.com`, `beeceptor.com` |
-| **Supply-chain C2** (1) | `sfrclak.com` (compromission axios 2026) |
+| **Supply-chain C2** (1) | `sfrclak.com` (axios compromise 2026) |
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai a deja `--blocked-domains` et `--allowed-domains` dans le proxy MITM, mais aucune liste par defaut. L'utilisateur doit tout configurer manuellement.
+parcai already has `--blocked-domains` and `--allowed-domains` in the MITM proxy, but no default list. Users must configure everything manually.
 
-### Comment l'integrer
+### How to integrate
 
-**Avantage parcai : le proxy MITM est superieur a `/etc/hosts`** car il voit le hostname complet dans les requetes CONNECT, donc il bloque aussi les sous-domaines (`sub.ngrok.io`), ce que `/etc/hosts` ne fait pas.
+**parcai advantage: the MITM proxy is superior to `/etc/hosts`** because it sees the full hostname in CONNECT requests, so it also blocks subdomains (`sub.ngrok.io`), which `/etc/hosts` cannot do.
 
-- Ajouter une blocklist par defaut dans le proxy, activee automatiquement quand `--secrets` est actif
-- Rendre la liste configurable via `.parcai.json` (`"default_blocklist": true/false`)
-- Permettre d'etendre la liste via `"extra_blocked_domains": [...]`
-- Stocker la liste dans un fichier separe (`blocklist/exfiltration.txt`) pour faciliter les mises a jour
+- Add a default blocklist in the proxy, automatically enabled when `--secrets` is active
+- Make the list configurable via `.parcai.json` (`"default_blocklist": true/false`)
+- Allow extending the list via `"extra_blocked_domains": [...]`
+- Store the list in a separate file (`blocklist/exfiltration.txt`) for easy updates
 
-**Effort : faible** -- la mecanique de filtrage existe deja dans le proxy, il suffit d'ajouter la liste par defaut.
+**Effort: low** -- the filtering mechanism already exists in the proxy, just need to add the default list.
 
 ---
 
-## 2. Blocklist de ports (pf firewall)
+## 2. Port Blocklist (pf Firewall)
 
-### Ce que fait hazmat
+### hazmat
 
-Regles `pf` scopees a l'utilisateur `agent` bloquant les protocoles d'exfiltration non-HTTP :
+`pf` rules scoped to the `agent` user blocking non-HTTP exfiltration protocols:
 
-| Port(s) | Protocole | Risque |
-|----------|-----------|--------|
-| 25, 465, 587 | SMTP | Envoi d'emails avec secrets |
-| 6660-6669, 6697 | IRC | Canal C2 |
-| 20, 21 | FTP | Upload de fichiers |
-| 23 | Telnet | Acces distant non chiffre |
-| 445 | SMB | Partage reseau |
-| 3389 | RDP | Bureau distant |
-| 5900, 5901 | VNC | Controle distant |
-| 9050, 9150 | Tor SOCKS | Trafic anonymise |
-| 1080 | SOCKS | Proxy generique |
-| 1194, 1723, 4500 | VPN | Tunnel VPN |
-| 5222, 5269 | XMPP | Messagerie |
-| ICMP | Ping | Tunnel ICMP |
+| Port(s) | Protocol | Risk |
+|----------|----------|------|
+| 25, 465, 587 | SMTP | Email with secrets |
+| 6660-6669, 6697 | IRC | C2 channel |
+| 20, 21 | FTP | File upload |
+| 23 | Telnet | Unencrypted remote access |
+| 445 | SMB | Network sharing |
+| 3389 | RDP | Remote desktop |
+| 5900, 5901 | VNC | Remote control |
+| 9050, 9150 | Tor SOCKS | Anonymized traffic |
+| 1080 | SOCKS | Generic proxy |
+| 1194, 1723, 4500 | VPN | VPN tunnel |
+| 5222, 5269 | XMPP | Messaging |
+| ICMP | Ping | ICMP tunneling |
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai utilise `(deny network*)` ou `(allow network*)` dans sandbox-exec -- c'est tout ou rien. Quand le reseau est actif (mode par defaut), tous les ports sont ouverts.
+parcai uses `(deny network*)` or `(allow network*)` in sandbox-exec -- all or nothing. When networking is enabled (default), all ports are open.
 
-### Comment l'integrer
+### How to integrate
 
-Deux approches possibles :
+Two possible approaches:
 
-**Option A -- Via le proxy MITM (recommande)** : Quand `--secrets` est actif, tout le trafic passe par le proxy. Le proxy peut rejeter les connexions CONNECT vers des ports non-standard. Ajouter une allowlist de ports (`80, 443, 8080, 8443`) et rejeter le reste.
+**Option A -- Via MITM proxy (recommended)**: When `--secrets` is active, all traffic flows through the proxy. The proxy can reject CONNECT requests to non-standard ports. Add a port allowlist (`80, 443, 8080, 8443`) and reject everything else.
 
-**Option B -- Via sandbox-exec** : Remplacer `(allow network*)` par des regles plus fines :
+**Option B -- Via sandbox-exec**: Replace `(allow network*)` with finer-grained rules:
 ```scheme
 (allow network-outbound (remote tcp "*:80"))
 (allow network-outbound (remote tcp "*:443"))
 (allow network-outbound (remote tcp "*:8080"))
 (allow network-outbound (remote tcp "*:8443"))
-(allow network-outbound (local tcp "*:*"))  ;; loopback pour le proxy
+(allow network-outbound (local tcp "*:*"))  ;; loopback for proxy
 ```
 
-L'option A est plus simple et deja dans le chemin d'execution existant. L'option B fonctionne meme sans `--secrets`.
+Option A is simpler and already in the existing execution path. Option B works even without `--secrets`.
 
-**Effort : faible a moyen** selon l'option choisie.
+**Effort: low to moderate** depending on the chosen option.
 
 ---
 
-## 3. Commande `explain` (contrat de session)
+## 3. `explain` Command (Session Contract)
 
-### Ce que fait hazmat
+### hazmat
 
-`hazmat explain` affiche un resume complet de ce que la session va faire **avant** de la lancer :
+`hazmat explain` displays a complete summary of what the session will do **before** launching:
 
 ```
 hazmat: session
@@ -121,15 +121,15 @@ hazmat: session
     - Go module cache is shared read-only...
 ```
 
-Supporte aussi `--json` pour l'integration CI/automation.
+Also supports `--json` for CI/automation integration.
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai a `--dry-run` qui affiche le profil sandbox et le chemin du clone, mais pas de vue synthetique "voici ce qui va se passer". Le verbose affiche des details techniques, pas un contrat lisible.
+parcai has `--dry-run` which prints the sandbox profile and clone path, but no synthetic view of "here's what will happen". Verbose mode shows technical details, not a readable contract.
 
-### Comment l'integrer
+### How to integrate
 
-Ajouter une commande `parcai explain` (ou enrichir `--dry-run`) qui affiche :
+Add a `parcai explain` command (or enrich `--dry-run`) that displays:
 
 ```
 parcai: session contract
@@ -147,15 +147,15 @@ parcai: session contract
   On exit:           ask
 ```
 
-**Effort : faible** -- les donnees sont deja disponibles dans les variables globales, il suffit de les formater.
+**Effort: low** -- all data is already available in global variables, just needs formatting.
 
 ---
 
-## 4. Support du clipboard dans le sandbox
+## 4. Clipboard Support in Sandbox
 
-### Ce que fait hazmat
+### hazmat
 
-Regles SBPL explicites pour le clipboard :
+Explicit SBPL rules for clipboard access:
 
 ```scheme
 (allow mach-lookup (global-name "com.apple.pboard"))
@@ -163,68 +163,68 @@ Regles SBPL explicites pour le clipboard :
 (allow ipc-posix-shm-write-data (ipc-posix-name-regex #"^com\\.apple\\.pasteboard\\."))
 ```
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai autorise `(allow mach-lookup)` globalement (toutes les services Mach). Le clipboard fonctionne implicitement mais la regle est trop large.
+parcai allows `(allow mach-lookup)` globally (all Mach services). Clipboard works implicitly but the rule is too broad.
 
-### Comment l'integrer
+### How to integrate
 
-Si parcai restreint `mach-lookup` a l'avenir (ce qui serait une amelioration securitaire), il faudra explicitement autoriser le clipboard. Pour l'instant, **noter comme dette technique** : le `(allow mach-lookup)` global est un point de durcissement futur.
+If parcai restricts `mach-lookup` in the future (which would be a security improvement), clipboard will need explicit authorization. For now, **note as tech debt**: the global `(allow mach-lookup)` is a future hardening target.
 
-**Effort : nul maintenant, faible quand mach-lookup sera restreint.**
+**Effort: none now, low when mach-lookup is restricted.**
 
 ---
 
-## 5. Execution depuis /tmp (langages compiles)
+## 5. Process Execution from /tmp (Compiled Languages)
 
-### Ce que fait hazmat
+### hazmat
 
 ```scheme
 (allow process-exec (subpath "/private/tmp"))
 ```
 
-Les compilateurs (gcc, rustc, go) ecrivent des binaires temporaires dans `/tmp` puis les executent. Sans cette regle, la compilation echoue.
+Compilers (gcc, rustc, go) write temporary binaries to `/tmp` and then execute them. Without this rule, compilation fails.
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai autorise `file-write*` sur `/tmp` mais PAS `process-exec`. Un agent qui compile du Go, Rust ou C dans le sandbox echouera a l'execution du binaire.
+parcai allows `file-write*` on `/tmp` but NOT `process-exec`. An agent compiling Go, Rust, or C inside the sandbox will fail to execute the resulting binary.
 
-### Comment l'integrer
+### How to integrate
 
-Ajouter dans `profiles/macos.sb.tpl` :
+Add to `profiles/macos.sb.tpl`:
 
 ```scheme
 (allow process-exec (subpath "/private/tmp"))
 ```
 
-**Effort : trivial** -- une ligne dans le template.
+**Effort: trivial** -- one line in the template.
 
-**Risque** : un agent pourrait ecrire un binaire malveillant dans `/tmp` et l'executer. Acceptable car le sandbox restreint tout ce que le binaire peut faire (filesystem, reseau, process).
+**Risk**: an agent could write a malicious binary to `/tmp` and execute it. Acceptable because the sandbox restricts everything the binary can do (filesystem, network, process).
 
 ---
 
-## 6. Metadata ancestors pour git
+## 6. Ancestor Metadata for git
 
-### Ce que fait hazmat
+### hazmat
 
-Pour chaque repertoire expose (read ou write), hazmat ajoute des regles `file-read-metadata` (stat seul, pas le contenu) pour chaque repertoire ancetre :
+For each exposed directory (read or write), hazmat adds `file-read-metadata` rules (stat only, no content) for every ancestor directory:
 
 ```scheme
-;; Si le projet est /Users/dr/workspace/myproject :
+;; If the project is /Users/dr/workspace/myproject:
 (allow file-read-metadata (literal "/Users"))
 (allow file-read-metadata (literal "/Users/dr"))
 (allow file-read-metadata (literal "/Users/dr/workspace"))
 ```
 
-**Pourquoi** : `git` fait de la canonicalisation de chemins (`realpath`) et a besoin de `stat()` sur les repertoires parents. Sans ca, certaines operations git echouent silencieusement.
+**Why**: `git` does path canonicalization (`realpath`) and needs `stat()` on parent directories. Without this, some git operations fail silently.
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai autorise `(allow file-read* (subpath "{{HOME}}"))` globalement, donc le probleme ne se pose pas. Mais c'est une regle trop large.
+parcai allows `(allow file-read* (subpath "{{HOME}}"))` globally, so the problem doesn't arise. But this rule is overly broad.
 
-### Comment l'integrer
+### How to integrate
 
-Si parcai restreint le `file-read*` sur `$HOME` (durcissement recommande), il faudra ajouter les regles metadata ancestors. Pattern :
+If parcai restricts `file-read*` on `$HOME` (recommended hardening), ancestor metadata rules will be needed. Pattern:
 
 ```bash
 path="$CLONE_DIR"
@@ -234,46 +234,46 @@ while [ "$path" != "/" ]; do
 done
 ```
 
-**Effort : faible** -- utile quand le profil sera durci.
+**Effort: low** -- useful when the profile is hardened.
 
 ---
 
-## 7. Generation dynamique du profil SBPL
+## 7. Dynamic SBPL Profile Generation
 
-### Ce que fait hazmat
+### hazmat
 
-Au lieu d'un template statique avec substitution de placeholders, hazmat genere le profil SBPL **programmatiquement** en Go. Chaque session a un profil unique calcule a partir de :
-- Le repertoire projet
-- Les integrations actives (read dirs, write dirs)
-- Les extensions CLI (`-R`, `-W`)
-- La resolution Homebrew
-- Les regles de credential deny
+Instead of a static template with placeholder substitution, hazmat generates the SBPL profile **programmatically** in Go. Each session gets a unique profile computed from:
+- The project directory
+- Active integrations (read dirs, write dirs)
+- CLI extensions (`-R`, `-W`)
+- Homebrew resolution
+- Credential deny rules
 
-Le code utilise un pattern "last-match-wins" : il ecrit les regles read d'abord, puis les regles write (qui reaffirment l'acces), puis les deny credentials en dernier (qui l'emportent sur tout).
+The code uses a "last-match-wins" pattern: it writes read rules first, then write rules (which reassert access), then credential denies last (which override everything).
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-Template statique (`profiles/macos.sb.tpl`) avec 5 placeholders : `{{CLONE}}`, `{{HOME}}`, `{{NETWORK_POLICY}}`, `{{PROXY_LOOPBACK_RULE}}`, `{{CLAUDE_EXEC_RULE}}`. Les regles custom (`--allow`, `--rw`, `--deny`) sont injectees par concatenation dans `generate_profile()`.
+Static template (`profiles/macos.sb.tpl`) with 5 placeholders: `{{CLONE}}`, `{{HOME}}`, `{{NETWORK_POLICY}}`, `{{PROXY_LOOPBACK_RULE}}`, `{{CLAUDE_EXEC_RULE}}`. Custom rules (`--allow`, `--rw`, `--deny`) are injected by concatenation in `generate_profile()`.
 
-### Comment l'integrer
+### How to integrate
 
-Deux niveaux :
+Two levels:
 
-**Niveau 1 (pragmatique)** : Garder le template mais enrichir la substitution. Ajouter des placeholders pour les read dirs, write dirs, et les regles d'integration auto-detectees. `generate_profile()` devient plus intelligent sans changer d'architecture.
+**Level 1 (pragmatic)**: Keep the template but enrich the substitution. Add placeholders for read dirs, write dirs, and auto-detected integration rules. `generate_profile()` becomes smarter without changing the architecture.
 
-**Niveau 2 (refonte)** : Passer a une generation programmatique complete. Necessiterait de reecrire la logique de profil en bash (faisable mais verbeux) ou de migrer vers un langage plus structure.
+**Level 2 (overhaul)**: Switch to fully programmatic generation. Would require rewriting the profile logic in bash (doable but verbose) or migrating to a more structured language.
 
-**Recommandation** : niveau 1 pour maintenant, niveau 2 si parcai depasse ~100 regles dynamiques.
+**Recommendation**: level 1 for now, level 2 if parcai exceeds ~100 dynamic rules.
 
-**Effort : moyen (niveau 1) / eleve (niveau 2).**
+**Effort: moderate (level 1) / high (level 2).**
 
 ---
 
-## 8. Systeme d'integrations par manifests
+## 8. Integration Manifest System
 
-### Ce que fait hazmat
+### hazmat
 
-Manifests YAML embarques dans le binaire, un par toolchain :
+YAML manifests embedded in the binary, one per toolchain:
 
 ```yaml
 # integrations/go.yaml
@@ -300,59 +300,59 @@ warnings:
   - "Go module cache is shared read-only"
 ```
 
-**13 integrations built-in** : go, node, rust, python-poetry, python-uv, ruby-bundler, java-gradle, java-maven, haskell-cabal, elixir-mix, opentofu-plan, terraform-plan, tla-java.
+**13 built-in integrations**: go, node, rust, python-poetry, python-uv, ruby-bundler, java-gradle, java-maven, haskell-cabal, elixir-mix, opentofu-plan, terraform-plan, tla-java.
 
-**Auto-detection** : si `go.mod` existe dans le projet -> integration go activee automatiquement.
+**Auto-detection**: if `go.mod` exists in the project -> go integration is automatically activated.
 
-**Securite** : chaque `read_dir` est valide contre une liste de credential deny paths. Si un manifest essaie d'exposer `~/.ssh`, il est rejete.
+**Security**: each `read_dir` is validated against a credential deny path list. If a manifest tries to expose `~/.ssh`, it is rejected.
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-Aucun systeme d'integration. L'utilisateur doit configurer manuellement chaque `--allow` pour les caches de modules, les toolchains, etc.
+No integration system. Users must manually configure each `--allow` for module caches, toolchains, etc.
 
-### Comment l'integrer
+### How to integrate
 
-Ajouter un systeme de detection dans `run_macos()` :
+Add a detection system in `run_macos()`:
 
 ```bash
-# Detection automatique
+# Auto-detection
 [ -f "$CWD/go.mod" ]      && auto_allow_read "$HOME/go/pkg/mod"
 [ -f "$CWD/package.json" ] && auto_allow_read "$HOME/.npm/_cacache"
 [ -f "$CWD/Cargo.toml" ]   && auto_allow_read "$HOME/.cargo/registry"
 [ -f "$CWD/pyproject.toml" ] && auto_allow_read "$HOME/.cache/uv"
 ```
 
-**Phase 1** : Detection inline dans le script bash (5-10 toolchains).
-**Phase 2** : Fichiers de config externes (`integrations/*.json`) charges dynamiquement.
+**Phase 1**: Inline detection in the bash script (5-10 toolchains).
+**Phase 2**: External config files (`integrations/*.json`) loaded dynamically.
 
-L'auto-detection ameliorerait significativement l'experience utilisateur -- plus besoin de savoir quels chemins autoriser pour chaque langage.
+Auto-detection would significantly improve user experience -- no need to know which paths to allow for each language.
 
-**Effort : faible (phase 1) / moyen (phase 2).**
+**Effort: low (phase 1) / moderate (phase 2).**
 
 ---
 
-## 9. Safe-list pour les variables d'environnement
+## 9. Environment Variable Safe-list
 
-### Ce que fait hazmat
+### hazmat
 
-Liste explicite de variables d'environnement "sures" autorisees en passthrough. Toutes les autres sont filtrees :
+Explicit list of "safe" environment variables allowed for passthrough. All others are filtered:
 
-**Autorisees** : `GOPATH`, `GOROOT`, `GOPROXY`, `RUSTUP_HOME`, `CARGO_HOME`, `NVM_DIR`, `PYENV_ROOT`, `JAVA_HOME`, `GEM_HOME`, `MIX_HOME`, `HEX_HOME`, `CABAL_DIR`, `STACK_ROOT`, `NPM_CONFIG_REGISTRY`, `PIP_INDEX_URL`, etc.
+**Allowed**: `GOPATH`, `GOROOT`, `GOPROXY`, `RUSTUP_HOME`, `CARGO_HOME`, `NVM_DIR`, `PYENV_ROOT`, `JAVA_HOME`, `GEM_HOME`, `MIX_HOME`, `HEX_HOME`, `CABAL_DIR`, `STACK_ROOT`, `NPM_CONFIG_REGISTRY`, `PIP_INDEX_URL`, etc.
 
-**Explicitement exclues** (dangereuses) : `NODE_OPTIONS`, `PYTHONPATH`, `GOFLAGS`, `MAVEN_OPTS`, `CGO_CFLAGS`, `CGO_LDFLAGS`, `RUBYOPT`, `PERL5OPT`, `LD_PRELOAD`, `DYLD_*`.
+**Explicitly excluded** (dangerous): `NODE_OPTIONS`, `PYTHONPATH`, `GOFLAGS`, `MAVEN_OPTS`, `CGO_CFLAGS`, `CGO_LDFLAGS`, `RUBYOPT`, `PERL5OPT`, `LD_PRELOAD`, `DYLD_*`.
 
-**Pourquoi** : `NODE_OPTIONS=--require=/path/to/malicious.js` permet d'injecter du code dans tout processus Node. `LD_PRELOAD` permet d'intercepter n'importe quel appel systeme.
+**Why**: `NODE_OPTIONS=--require=/path/to/malicious.js` allows injecting code into any Node process. `LD_PRELOAD` allows intercepting any system call.
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai injecte un `PATH` controle dans `.zshenv` et transmet les `env` overrides de `.parcai.json` sans filtrage. Les variables dangereuses de l'environnement host ne sont pas nettoyees.
+parcai injects a controlled `PATH` in `.zshenv` and forwards `env` overrides from `.parcai.json` without filtering. Dangerous host environment variables are not sanitized.
 
-### Comment l'integrer
+### How to integrate
 
-Dans la generation du `.zshenv`, ajouter un `unset` explicite des variables dangereuses :
+In `.zshenv` generation, add explicit `unset` for dangerous variables:
 
 ```bash
-# Dans inject_env_into_shell_config()
+# In inject_env_into_shell_config()
 for dangerous in NODE_OPTIONS PYTHONPATH LD_PRELOAD DYLD_INSERT_LIBRARIES \
                  DYLD_LIBRARY_PATH GOFLAGS MAVEN_OPTS CGO_CFLAGS CGO_LDFLAGS \
                  RUBYOPT PERL5OPT BASH_ENV ENV; do
@@ -360,72 +360,72 @@ for dangerous in NODE_OPTIONS PYTHONPATH LD_PRELOAD DYLD_INSERT_LIBRARIES \
 done
 ```
 
-**Effort : trivial** -- quelques lignes dans le script.
+**Effort: trivial** -- a few lines in the script.
 
-**Impact securitaire : eleve** -- ferme un vecteur d'injection actuellement ouvert.
+**Security impact: high** -- closes a currently open injection vector.
 
 ---
 
-## 10. Snapshots pre-session
+## 10. Pre-session Snapshots
 
-### Ce que fait hazmat
+### hazmat
 
-Avant chaque session, Kopia prend un snapshot incremental du projet. Politique de retention : 20 derniers, 7 quotidiens, 4 hebdomadaires. `hazmat restore --session=N` restaure N sessions en arriere (avec snapshot pre-restore pour pouvoir annuler).
+Before each session, Kopia takes an incremental snapshot of the project. Retention policy: 20 latest, 7 daily, 4 weekly. `hazmat restore --session=N` restores N sessions back (with a pre-restore snapshot so it can be undone).
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai utilise des clones APFS (copy-on-write) -- l'original n'est jamais modifie pendant la session. Les changements sont appliques explicitement par l'utilisateur apres la session. Pas d'historique au-dela de la session courante.
+parcai uses APFS clones (copy-on-write) -- the original is never modified during the session. Changes are explicitly applied by the user after the session. No history beyond the current session.
 
-### Comment l'integrer
+### How to integrate
 
-L'architecture clone de parcai rend les snapshots moins critiques (l'original est protege). Mais un historique serait utile pour :
-- Annuler un `--apply` accidentel
-- Comparer l'etat du projet entre plusieurs sessions d'agent
+parcai's clone architecture makes snapshots less critical (the original is protected). But history would be useful for:
+- Undoing an accidental `--apply`
+- Comparing project state across multiple agent sessions
 
-**Approche legere (sans Kopia)** :
+**Lightweight approach (without Kopia)**:
 
 ```bash
-# Avant apply_changes()
+# Before apply_changes()
 snapshot_dir="$SESS_DIR/snapshots/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$snapshot_dir"
 rsync -a --link-dest="$CWD" "$CWD/" "$snapshot_dir/"
 ```
 
-Avec `--link-dest`, rsync utilise des hard links -- le snapshot ne consomme de l'espace que pour les fichiers modifies.
+With `--link-dest`, rsync uses hard links -- the snapshot only consumes space for modified files.
 
-**Commande de restauration** : `parcai restore [--session=N]`
+**Restore command**: `parcai restore [--session=N]`
 
-**Effort : moyen.**
+**Effort: moderate.**
 
 ---
 
-## 11. Appel direct a sandbox_init()
+## 11. Direct sandbox_init() Call
 
-### Ce que fait hazmat
+### hazmat
 
-`hazmat-launch` est un binaire CGO qui appelle `sandbox_init()` directement au lieu de passer par `sandbox-exec`. Avantages :
-- **Signal forwarding correct** : le processus sandbox EST le processus cible (pas de wrapper)
-- **PTY handling natif** : pas besoin de hacks pour le terminal interactif
-- **Une couche de moins** : `sudo -> hazmat-launch -> target` au lieu de `sudo -> sandbox-exec -> target`
+`hazmat-launch` is a CGO binary that calls `sandbox_init()` directly instead of going through `sandbox-exec`. Benefits:
+- **Correct signal forwarding**: the sandboxed process IS the target process (no wrapper)
+- **Native PTY handling**: no hacks needed for interactive terminal
+- **One fewer layer**: `sudo -> hazmat-launch -> target` instead of `sudo -> sandbox-exec -> target`
 
-Validations de securite avant l'appel :
-- Chemin du fichier policy restreint par regex
-- Proprietaire du fichier verifie (doit etre l'invocateur, pas root)
-- Mode du fichier verifie (0644 exact)
-- Contenu verifie (doit contenir `(deny default)`)
+Security validations before the call:
+- Policy file path restricted by regex
+- File owner verified (must be the invoker, not root)
+- File mode verified (exactly 0644)
+- Content verified (must contain `(deny default)`)
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai utilise `sandbox-exec -f profile.sb /bin/zsh -i`. Le TTY est gere via un hack : Claude est lance depuis `.zshrc` (pas `zsh -c`) pour preserver `setRawMode`.
+parcai uses `sandbox-exec -f profile.sb /bin/zsh -i`. TTY is handled via a hack: Claude is launched from `.zshrc` (not `zsh -c`) to preserve `setRawMode`.
 
-### Comment l'integrer
+### How to integrate
 
-Deux options :
+Two options:
 
-**Option A -- Helper binaire minimal** : Un petit programme C (~50 lignes) qui :
-1. Lit le fichier policy
-2. Appelle `sandbox_init(policy, 0, &err)`
-3. `exec()` le shell cible
+**Option A -- Minimal helper binary**: A small C program (~50 lines) that:
+1. Reads the policy file
+2. Calls `sandbox_init(policy, 0, &err)`
+3. `exec()` the target shell
 
 ```c
 #include <sandbox.h>
@@ -444,33 +444,33 @@ int main(int argc, char *argv[]) {
 }
 ```
 
-Compile avec : `cc -o parcai-sandbox main.c -Wno-deprecated-declarations`
+Compiled with: `cc -o parcai-sandbox main.c -Wno-deprecated-declarations`
 
-**Option B -- Rester sur sandbox-exec** : Le hack `.zshrc` fonctionne. Le gain ne justifie peut-etre pas l'ajout d'un binaire compile a un projet qui est volontairement 100% script.
+**Option B -- Stay on sandbox-exec**: The `.zshrc` hack works. The gain may not justify adding a compiled binary to a project that is intentionally 100% scripted.
 
-**Recommandation** : Option B pour maintenant. Option A si des problemes de signaux ou de PTY sont remontes.
+**Recommendation**: Option B for now. Option A if signal or PTY issues are reported.
 
-**Effort : faible (option A) mais change la philosophie du projet.**
+**Effort: low (option A) but changes the project philosophy.**
 
 ---
 
-## 12. Runner pattern (verbose/dry-run)
+## 12. Runner Pattern (verbose/dry-run)
 
-### Ce que fait hazmat
+### hazmat
 
-Toutes les commandes systeme passent par une abstraction `Runner` qui :
-- Affiche la commande avant execution en mode verbose
-- Affiche une **raison** humaine pour chaque sudo (`"creating agent user for sandbox isolation"`)
-- En dry-run, affiche ce qui serait fait sans rien executer
-- Distingue les commandes normales, sudo, et sudo-as-agent
+All system commands go through a `Runner` abstraction that:
+- Displays the command before execution in verbose mode
+- Shows a human-readable **reason** for each sudo call (`"creating agent user for sandbox isolation"`)
+- In dry-run mode, displays what would be done without executing
+- Distinguishes between normal commands, sudo, and sudo-as-agent
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai a `--verbose` et `--dry-run` mais l'implementation est ad-hoc : des `if [ "$VERBOSE" = true ]` eparpilles dans le code.
+parcai has `--verbose` and `--dry-run` but the implementation is ad-hoc: scattered `if [ "$VERBOSE" = true ]` checks throughout the code.
 
-### Comment l'integrer
+### How to integrate
 
-Creer une fonction wrapper :
+Create a wrapper function:
 
 ```bash
 run() {
@@ -483,64 +483,64 @@ run() {
   "$@"
 }
 
-# Usage :
+# Usage:
 run "Creating APFS clone of project" cp -c -R "$src" "$dst"
 run "Generating sandbox profile" generate_profile "$clone" "$home"
 ```
 
-**Effort : faible** -- refactoring progressif, fonction par fonction.
+**Effort: low** -- incremental refactoring, function by function.
 
 ---
 
-## 13. Support multi-agent
+## 13. Multi-agent Support
 
-### Ce que fait hazmat
+### hazmat
 
-Abstraction `harness` supportant Claude, Codex et OpenCode. Chaque agent a :
-- Sa commande de lancement
-- Son repertoire de config
-- Ses fichiers de bootstrap
-- Sa logique d'installation
+A `harness` abstraction supporting Claude, Codex, and OpenCode. Each agent has:
+- Its launch command
+- Its config directory
+- Its bootstrap files
+- Its installation logic
 
-### Ce que parcai fait aujourd'hui
+### parcai
 
-parcai est cable sur Claude (lancement via `.zshrc`, persistence de `~/.claude/`). `--shell` permet un shell generique mais sans support specifique d'autres agents.
+parcai is hardcoded to Claude (launched via `.zshrc`, persists `~/.claude/`). `--shell` allows a generic shell but without specific support for other agents.
 
-### Comment l'integrer
+### How to integrate
 
-**Phase 1** : Ajouter `--agent codex|opencode` qui modifie :
-- La commande lancee dans `.zshrc`
-- Les chemins de config persistes
-- Le binaire autorise dans le profil sandbox
+**Phase 1**: Add `--agent codex|opencode` which modifies:
+- The command launched in `.zshrc`
+- The config paths that are persisted
+- The allowed binary in the sandbox profile
 
-**Phase 2** : Abstraction plus formelle si le nombre d'agents supporte augmente.
+**Phase 2**: More formal abstraction if the number of supported agents grows.
 
-**Effort : moyen (phase 1).**
+**Effort: moderate (phase 1).**
 
 ---
 
-## 14. Matrice de priorisation
+## 14. Prioritization Matrix
 
-| # | Feature | Impact securite | Impact UX | Effort | Priorite |
+| # | Feature | Security Impact | UX Impact | Effort | Priority |
 |---|---------|----------------|-----------|--------|----------|
-| 9 | **Safe-list env vars** | **Eleve** | Faible | Trivial | **P0** |
-| 5 | **Exec depuis /tmp** | Faible | **Eleve** | Trivial | **P0** |
-| 1 | **Blocklist domaines par defaut** | **Eleve** | Moyen | Faible | **P1** |
-| 3 | **Commande `explain`** | Faible | **Eleve** | Faible | **P1** |
-| 12 | **Runner pattern** | Faible | Moyen | Faible | **P1** |
-| 8 | **Integrations auto-detectees** | Moyen | **Eleve** | Faible-Moyen | **P1** |
-| 2 | **Blocklist de ports** | Moyen | Faible | Faible-Moyen | **P2** |
-| 6 | **Metadata ancestors** | Faible | Faible | Faible | **P2** |
-| 7 | **SBPL dynamique** | Moyen | Moyen | Moyen | **P2** |
-| 13 | **Multi-agent** | Faible | Moyen | Moyen | **P2** |
-| 10 | **Snapshots pre-session** | Faible | Moyen | Moyen | **P3** |
-| 11 | **sandbox_init() direct** | Faible | Faible | Faible | **P3** |
-| 4 | **Clipboard (mach-lookup)** | Faible | Faible | Nul | **P3** |
+| 9 | **Env var safe-list** | **High** | Low | Trivial | **P0** |
+| 5 | **Exec from /tmp** | Low | **High** | Trivial | **P0** |
+| 1 | **Default domain blocklist** | **High** | Moderate | Low | **P1** |
+| 3 | **`explain` command** | Low | **High** | Low | **P1** |
+| 12 | **Runner pattern** | Low | Moderate | Low | **P1** |
+| 8 | **Auto-detected integrations** | Moderate | **High** | Low-Moderate | **P1** |
+| 2 | **Port blocklist** | Moderate | Low | Low-Moderate | **P2** |
+| 6 | **Ancestor metadata** | Low | Low | Low | **P2** |
+| 7 | **Dynamic SBPL** | Moderate | Moderate | Moderate | **P2** |
+| 13 | **Multi-agent** | Low | Moderate | Moderate | **P2** |
+| 10 | **Pre-session snapshots** | Low | Moderate | Moderate | **P3** |
+| 11 | **sandbox_init() direct** | Low | Low | Low | **P3** |
+| 4 | **Clipboard (mach-lookup)** | Low | Low | None | **P3** |
 
-### Recommandation d'execution
+### Recommended Execution Plan
 
-**Sprint 1 (quick wins)** : items P0 + P1 haut -- safe-list env, exec /tmp, blocklist domaines, commande explain. ~1-2 jours de travail.
+**Sprint 1 (quick wins)**: P0 + top P1 items -- env safe-list, exec /tmp, domain blocklist, explain command. ~1-2 days of work.
 
-**Sprint 2 (hardening)** : integrations auto, runner pattern, blocklist ports. ~2-3 jours.
+**Sprint 2 (hardening)**: auto integrations, runner pattern, port blocklist. ~2-3 days.
 
-**Sprint 3 (evolution)** : multi-agent, SBPL dynamique, snapshots. ~1 semaine.
+**Sprint 3 (evolution)**: multi-agent, dynamic SBPL, snapshots. ~1 week.
