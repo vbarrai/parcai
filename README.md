@@ -56,6 +56,34 @@ sudo ln -s "$PWD/parcai/parcai" /usr/local/bin/parcai
 
 - **macOS 10.13+** with APFS (default since 2017). Uses `sandbox-exec`.
 
+### Shell aliases
+
+Add these to your `~/.zshrc` (or `~/.bashrc`) to launch Claude through parcai with a single command:
+
+```bash
+# Launch Claude in a sandbox (default)
+alias claude-safe="parcai"
+
+# Launch Claude in a sandbox with auto-apply on exit
+alias claude-yolo="parcai --apply"
+
+# Launch Claude in a sandbox with no network access
+alias claude-offline="parcai --no-network"
+
+# Launch Claude in a sandbox with secret masking
+alias claude-secrets="parcai --secrets .env"
+```
+
+Then reload your shell (`source ~/.zshrc`) and use them from any project directory:
+
+```bash
+cd my-project
+claude-safe         # sandboxed Claude
+claude-yolo         # sandboxed Claude, auto-apply changes
+claude-offline      # sandboxed Claude, no network
+claude-secrets      # sandboxed Claude, .env secrets masked
+```
+
 ## Usage
 
 ### Basic
